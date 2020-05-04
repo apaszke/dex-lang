@@ -139,6 +139,8 @@ valFromPtrs :: Type -> [Ptr ()] -> IO Val
 valFromPtrs ty = evalStateT (valFromPtrs' [] ty)
 
 valFromPtrs' :: [Int] -> Type -> StateT [Ptr ()] IO Val
+valFromPtrs' shape (TabTy idx@(FixedIntRange low high) a) =
+  liftM (Con . AFor idx) $ valFromPtrs' (shape ++ [(high - low)]) a
 valFromPtrs' shape ty@(TC con) = case con of
   BaseType b -> do
     ~(ptr:ptrs) <- get
@@ -146,8 +148,6 @@ valFromPtrs' shape ty@(TC con) = case con of
     arrayVal <- liftIO $ loadArray $ ArrayRef (shape, b) ptr
     return $ Con $ AGet $ Con $ ArrayLit $ arrayVal
   RecType r -> liftM (Con . RecCon) $ traverse (valFromPtrs' shape) r
-  TabType idx@(FixedIntRange low high) a ->
-    liftM (Con . AFor idx) $ valFromPtrs' (shape ++ [(high - low)]) a
   IntRange _ _ -> do
     liftM (Con . AsIdx ty) $ valFromPtrs' shape (TC $ BaseType IntType)
   _ -> error $ "Not implemented: " ++ pprint ty
