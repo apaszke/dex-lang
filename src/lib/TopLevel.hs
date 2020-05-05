@@ -5,6 +5,7 @@
 -- https://developers.google.com/open-source/licenses/bsd
 
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE OverloadedStrings #-}
 
@@ -55,7 +56,7 @@ data BackendEngine = LLVMEngine LLVMEngine
                    | InterpEngine
 
 type LLVMEngine = MVar (Env ArrayRef)
-type JaxServer = PipeServer (JExpr -> [JAtom], ())
+type JaxServer = PipeServer '[JExpr -> [JAtom]]
 
 type TopPassM a = ReaderT EvalConfig IO a
 
