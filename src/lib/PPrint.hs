@@ -75,7 +75,7 @@ instance Pretty Type where
                  [(p eff <+> p v) | (v, (eff,_)) <- envPairs row]
         tailVar = case t of Nothing -> mempty
                             Just v  -> "|" <+> p v
-    NoAnn  -> ""
+    NoAnn  -> "-"
     TC con -> p con
     where
       arrStr :: Type -> Doc ann
@@ -84,10 +84,11 @@ instance Pretty Type where
 
 instance Pretty ty => Pretty (TyCon ty Atom) where
   pretty con = case con of
-    BaseType b  -> p b
-    RecType r   -> p $ fmap (asStr . p) r
-    RefType t   -> "Ref" <+> p t
-    TypeApp f xs -> p f <+> hsep (map p xs)
+    BaseType b     -> p b
+    RecType r      -> p $ fmap (asStr . p) r
+    SumType (l, r) -> "Either" <+> p l <+> p r
+    RefType t      -> "Ref" <+> p t
+    TypeApp f xs   -> p f <+> hsep (map p xs)
     ArrayType (shape, b) -> p b <> p shape
     -- This rule forces us to specialize to Atom. Is there a better way?
     IntRange (IntVal 0) (IntVal n) -> p n
@@ -179,6 +180,11 @@ instance (Pretty ty, Pretty e, PrettyLam lam) => Pretty (PrimCon ty e lam) where
   pretty (AsIdx n i)   = p i <> "@" <> p n
   pretty con = prettyExprDefault (ConExpr con)
 
+instance (Pretty v, Pretty ty) => Pretty (PatP v ty) where
+  pretty (RecPat r)    = pretty r
+  pretty (LSumPat v t) = "(Left"  <+> "@" <> pretty t <+> pretty v <> ")"
+  pretty (RSumPat t v) = "(Right" <+> pretty v <+> "@" <> pretty t <> ")"
+
 prettyExprDefault :: (Pretty e, PrettyLam lam) => PrimExpr ty e lam -> Doc ann
 prettyExprDefault expr =
   p ("%" ++ nameToStr blankExpr) <+> hsep (map p xs ++ map prettyL lams)
@@ -218,7 +224,7 @@ instance Pretty Kind where
 instance Pretty a => Pretty (VarP a) where
   pretty (v :> ann) =
     case asStr ann' of
-      ""     -> p v
+      "-"    -> p v
       "Type" -> p v
       _      -> p v <> ":" <> ann'
     where ann' = p ann

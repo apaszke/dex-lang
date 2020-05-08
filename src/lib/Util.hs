@@ -10,9 +10,11 @@ module Util (group, ungroup, pad, padLeft, delIdx, replaceIdx,
              insertIdx, mvIdx, mapFst, mapSnd, splitOn, traverseFun,
              composeN, mapMaybe, lookup, uncons, repeated,
              showErr, listDiff, splitMap, enumerate, restructure,
-             onSnd, onFst, highlightRegion, findReplace, swapAt) where
+             onSnd, onFst, highlightRegion, findReplace, swapAt,
+             bitoListLeft) where
 
-import Data.List (sort)
+import Data.Bifoldable
+import qualified Data.List as L
 import Prelude hiding (lookup)
 import qualified Data.Set as Set
 import qualified Data.Map.Strict as M
@@ -114,7 +116,7 @@ lookup target (x:xs) | x == target = Just 0
                          return (ans + 1)
 
 repeated :: Ord a => [a] -> [a]
-repeated = repeatedSorted . sort
+repeated = repeatedSorted . L.sort
 
 repeatedSorted :: Eq a => [a] -> [a]
 repeatedSorted [] = []
@@ -186,3 +188,6 @@ asState f = do
   let (ans, s') = f s
   put s'
   return ans
+
+bitoListLeft :: Bifoldable t => t a b -> [a]
+bitoListLeft = bifoldMap (:[]) (const [])

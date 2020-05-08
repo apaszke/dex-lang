@@ -12,6 +12,7 @@ module Normalize (normalizeModule, normalizeVal) where
 import Control.Monad
 import Control.Monad.Reader
 import Data.Foldable
+import Data.Bitraversable
 
 import Env
 import Syntax
@@ -21,6 +22,7 @@ import Type
 import Embed
 import Subst
 import Record
+import Util (bitoListLeft)
 
 type NormM a = ReaderT SubstEnv Embed a
 
@@ -72,17 +74,20 @@ normalizeLam (FLamExpr p body) = do
 
 normalizePat :: Pat -> NormM Var
 normalizePat p = do
-  ty <- liftM getType $ traverse (traverse substNorm) p
-  let v' = case toList p of (v:>_):_ -> v
-                            []       -> NoName
+  ty <- liftM getType $ bitraverse (traverse substNorm) substNorm p
+  let v' = case bitoListLeft p of (v:>_):_ -> v
+                                  []       -> NoName
   return $ v':>ty
 
 bindPat :: Pat -> Atom -> NormM SubstEnv
-bindPat (RecLeaf v) x = return $ v @> L x
-bindPat (RecTree r) xs =
+bindPat (RecPat p)  = bindRecTree p
+
+bindRecTree :: RecTree Var -> Atom -> NormM SubstEnv
+bindRecTree (RecLeaf v) x = return $ v @> L x
+bindRecTree (RecTree r) xs =
   liftM fold $ flip traverse (recNameVals r) $ \(i, p) -> do
     x <- nRecGet xs i
-    bindPat p x
+    bindRecTree p x
 
 normalizeDecl :: FDecl -> NormM SubstEnv
 normalizeDecl decl = case decl of

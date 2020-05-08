@@ -14,9 +14,12 @@ module Inference (inferModule) where
 import Control.Monad
 import Control.Monad.Reader
 import Control.Monad.Except hiding (Except)
-import Data.Foldable (toList, fold)
+import Data.Foldable (fold)
 import qualified Data.Map.Strict as M
 import Data.Text.Prettyprint.Doc
+import Data.Bifunctor
+import Data.Bifoldable
+import Data.Bitraversable
 
 import Syntax
 import Env
@@ -25,6 +28,7 @@ import Type
 import PPrint
 import Cat
 import Subst
+import Util (bitoListLeft)
 
 type InferM = ReaderT TypeEnv (SolverT (Either Err))
 
@@ -77,7 +81,7 @@ inferDecl eff decl = case decl of
     liftEither $ checkPatShadow p
     p' <- annotPat p
     bound' <- check bound (eff, getType p')
-    return (LetMono p' bound', foldMap asEnv p')
+    return (LetMono p' bound', bifoldMap asEnv (const mempty) p')
   LetPoly b@(v:>ty) tlam -> do
     ty' <- inferKinds TyKind ty
     tlam' <- checkTLam ty' tlam
@@ -174,7 +178,7 @@ checkLam (FLamExpr p body) piTy@(Pi a _) = do
   p' <- checkPat p a
   piTy' <- zonk piTy
   effTy <- maybeApplyPi piTy' (Just (Var (getPatName p :> a)))
-  body' <- extendR (foldMap asEnv p') $ check body effTy
+  body' <- extendR (bifoldMap asEnv (const mempty) p') $ check body effTy
   return $ FLamExpr p' body'
 
 checkPat :: Pat -> Type -> InferM Pat
@@ -196,7 +200,7 @@ fTyApp v tys = FPrimExpr $ OpExpr $ TApp (FVar v) tys
 
 checkPatShadow :: Pat -> Except ()
 checkPatShadow pat = do
-  let dups = filter (/= NoName) $ findDups $ map varName $ toList pat
+  let dups = filter (/= NoName) $ findDups $ map varName $ bitoListLeft pat
   unless (null dups) $ throw RepeatedVarErr $ pprintList dups
 
 findDups :: Eq a => [a] -> [a]
@@ -231,7 +235,7 @@ generateOpSubExprTypes op = case op of
     s  <- freshQ
     m' <- traverse (doMSnd freshQ) m
     return $ PrimEffect (ref, RefTy s) m'
-  RunReader r f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+  RunReader r f@(FLamExpr (RecPat (RecLeaf (v:>_))) _) -> do
     r' <- freshQ
     a  <- freshQ
     tailVar <- freshInferenceVar EffectKind
@@ -239,7 +243,7 @@ generateOpSubExprTypes op = case op of
     let eff = Effect ((v:>()) @> (Reader, refTy)) (Just tailVar)
     let fTy = makePi (v:>refTy) (eff, a)
     return $ RunReader (r, r') (f, fTy)
-  RunWriter f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+  RunWriter f@(FLamExpr (RecPat (RecLeaf (v:>_))) _) -> do
     w <- freshQ
     a <- freshQ
     tailVar <- freshInferenceVar EffectKind
@@ -247,7 +251,7 @@ generateOpSubExprTypes op = case op of
     let eff = Effect ((v:>()) @> (Writer,refTy)) (Just tailVar)
     let fTy = makePi (v:>refTy) (eff, a)
     return $ RunWriter (f, fTy)
-  RunState s f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+  RunState s f@(FLamExpr (RecPat (RecLeaf (v:>_))) _) -> do
     s' <- freshQ
     a  <- freshQ
     tailVar <- freshInferenceVar EffectKind
@@ -255,7 +259,7 @@ generateOpSubExprTypes op = case op of
     let eff = Effect ((v:>()) @> (State, refTy)) (Just tailVar)
     let fTy = makePi (v:>refTy) (eff, a)
     return $ RunState (s, s') (f, fTy)
-  IndexEff effName tabRef i f@(FLamExpr (RecLeaf (v:>_)) _) -> do
+  IndexEff effName tabRef i f@(FLamExpr (RecPat (RecLeaf (v:>_))) _) -> do
     i' <- freshQ
     x  <- freshQ
     a  <- freshQ
@@ -277,7 +281,7 @@ doMSnd :: Monad m => m b -> a -> m (a, b)
 doMSnd m x = do { y <- m; return (x, y) }
 
 annotPat :: Pat -> InferM Pat
-annotPat pat = traverse annotBinder pat
+annotPat pat = bitraverse annotBinder (inferKinds TyKind) pat
 
 annotBinder :: Var -> InferM Var
 annotBinder (v:>ann) = liftM (v:>) (inferKinds TyKind ann)
@@ -479,10 +483,11 @@ unify t1 t2 = do
         case zipWithRecord unify r r' of
           Nothing -> throw TypeErr ""
           Just unifiers -> void $ sequence unifiers
+      (SumType (l, r), SumType (l', r')) -> unify l l' >> unify r r'
       (TypeApp f xs, TypeApp f' xs') | length xs == length xs' ->
         unify f f' >> zipWithM_ unify xs xs'
-      _ -> throw TypeErr ""
-    _   -> throw TypeErr ""
+      _   -> throw TypeErr "Couldn't unify types"
+    _   -> throw TypeErr "Couldn't unify types"
 
 rowMeet :: Env a -> Env b -> Env (a, b)
 rowMeet (Env m) (Env m') = Env $ M.intersectionWith (,) m m'
@@ -547,7 +552,7 @@ instance TySubst FLamExpr where
 
 instance TySubst FDecl where
   tySubst env decl = case decl of
-    LetMono p e -> LetMono (fmap (tySubst env) p) (tySubst env e)
+    LetMono p e -> LetMono (bimap (tySubst env) (tySubst env) p) (tySubst env e)
     LetPoly ~(v:>Forall ks qs ty) lam ->
       LetPoly (v:>Forall ks qs (tySubst env ty)) (tySubst env lam)
     TyDef v ty -> TyDef v (tySubst env ty)
@@ -560,6 +565,9 @@ instance (TySubst a, TySubst b) => TySubst (a, b) where
 
 instance TySubst a => TySubst (VarP a) where
   tySubst env (v:>ty) = v:> tySubst env ty
+
+instance (TySubst v, TySubst ty) => TySubst (PatP v ty) where
+  tySubst env p  = bimap (tySubst env) (tySubst env) p
 
 instance TySubst a => TySubst (RecTree a) where
   tySubst env p = fmap (tySubst env) p

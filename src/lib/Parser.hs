@@ -172,7 +172,7 @@ exprAsModule :: FExpr -> (Var, FModule)
 exprAsModule e = (v, Module Nothing modTy body)
   where
     v = "*ans*" :> NoAnn
-    body = [LetMono (RecLeaf v) e]
+    body = [LetMono (RecPat $ RecLeaf v) e]
     modTy = (envToVarList $ freeVars e, [fmap L v])
 
 envToVarList :: TypeEnv -> [VarP (LorT Type Kind)]
@@ -198,7 +198,7 @@ letPolyTail s = do
 
 letPolyToMono :: FDecl -> FDecl
 letPolyToMono d = case d of
-  LetPoly (v:> Forall [] _ ty) (FTLam [] _ rhs) -> LetMono (RecLeaf $ v:> ty) rhs
+  LetPoly (v:> Forall [] _ ty) (FTLam [] _ rhs) -> LetMono (RecPat $ RecLeaf $ v:> ty) rhs
   _ -> d
 
 letMono :: Parser FDecl
@@ -233,7 +233,7 @@ wrapStatements statements = case statements of
   s:rest -> FDecl s' (wrapStatements rest)
     where s' = case s of
                  Left  d -> d
-                 Right e -> LetMono (RecLeaf (NoName:>NoAnn)) e
+                 Right e -> LetMono (RecPat $ RecLeaf $ NoName:>NoAnn) e
   [] -> error "Shouldn't be reachable"
 
 statement :: Parser Statement
@@ -445,15 +445,25 @@ binder = (symbol "_" >> return (NoName :> NoAnn))
      <|> liftM2 (:>) lowerName typeAnnot
 
 pat :: Parser Pat
-pat =   parenPat
-    <|> liftM RecLeaf binder
+pat =   sumPat "Left"  (\v -> LSumPat v NoAnn)
+    <|> sumPat "Right" (\v -> RSumPat NoAnn v)
+    <|> RecPat <$> recPat
 
-parenPat :: Parser Pat
+recPat :: Parser (RecTree Var)
+recPat =   parenPat
+       <|> liftM RecLeaf binder
+
+parenPat :: Parser (RecTree Var)
 parenPat = do
-  ans <- parens $ prod pat
+  ans <- parens $ prod recPat
   return $ case ans of
     Left  x  -> x
     Right xs -> RecTree $ Tup xs
+
+sumPat :: String -> (Var -> Pat) -> Parser Pat
+sumPat patName constr = do
+  try $ symbol "(" >> symbol patName
+  (constr <$> binder) <* symbol ")"
 
 lowerName :: Parser Name
 lowerName = name SourceName identifier
@@ -643,6 +653,7 @@ tyAppRule = InfixL (sc *> notFollowedBy (choice . map symbol $ tyOpNames)
   where tyOpNames = ["=>", "->", "--o"]
 
 applyType :: Type -> Type -> Type
+applyType (TC (TypeApp (TypeVar (Name SourceTypeName "Either" 0 :> _)) [l])) r = TC $ SumType (l, r)
 applyType (TC (TypeApp ty args)) arg = TC $ TypeApp ty (args ++ [arg])
 applyType ty arg = TC $ TypeApp ty [arg]
 

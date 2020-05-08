@@ -15,7 +15,6 @@ import Control.Concurrent.MVar
 import Control.Monad.State
 import Control.Monad.Reader
 import Control.Monad.Except hiding (Except)
-import Data.Foldable (toList)
 import Data.String
 import Data.Text.Prettyprint.Doc
 
@@ -40,7 +39,7 @@ import PipeRPC
 import Record
 import Subst
 import JAX
-import Util (highlightRegion)
+import Util (highlightRegion, bitoListLeft)
 
 data Backend = LLVM | Interp | JAX
 data EvalConfig = EvalConfig
@@ -107,18 +106,18 @@ evalSourceBlock env@(TopEnv (typeEnv, _) _ _) block = case sbContents block of
     source <- liftIO $ readFile fname
     let val = ignoreExcept $ parseData source
     let decl = LetMono p val
-    let outVars = map (\(v:>ty) -> v:>L ty) $ toList p
+    let outVars = map (\(v:>ty) -> v:>L ty) $ bitoListLeft p
     evalModule env $ Module (sbId block) ([], outVars) [decl]
   LoadData p DexBinaryObject fname -> do
     val <- liftIO $ loadDataFile fname
     -- TODO: handle patterns and type annotations in binder
-    let (RecLeaf b) = p
+    let (RecPat (RecLeaf b)) = p
     let outEnv = b @> L val
     return $ TopEnv (substEnvType outEnv, mempty) outEnv mempty
   RuleDef ann@(LinearizationDef v) ~(Forall [] [] ty) ~(FTLam [] [] expr) -> do
     let v' = fromString (pprint v ++ "!lin") :> ty  -- TODO: name it properly
     let imports = map (uncurry (:>)) $ envPairs $ freeVars ann <> freeVars ty <> freeVars expr
-    let m = Module (sbId block) (imports, [fmap L v']) [LetMono (RecLeaf v') expr]
+    let m = Module (sbId block) (imports, [fmap L v']) [LetMono (RecPat (RecLeaf v')) expr]
     env' <- evalModule env m
     return $ env' <> TopEnv mempty mempty ((v:>()) @> Var v')
   UnParseable _ s -> liftEitherIO $ throw ParseErr s

@@ -22,6 +22,7 @@ import Control.Monad
 import Control.Monad.Except hiding (Except)
 import Control.Monad.Reader
 import Data.Foldable
+import Data.Bifoldable
 import qualified Data.Map.Strict as M
 import Data.Text.Prettyprint.Doc
 
@@ -126,6 +127,7 @@ tyConKind con = case con of
   IndexRange t a b  -> (IndexRange (t, TyKind) (fmap (,t) a)
                                                (fmap (,t) b), TyKind)
   ArrayType t       -> (ArrayType t, TyKind)
+  SumType (l, r)    -> (SumType ((l, TyKind), (r, TyKind)), TyKind)
   RecType r         -> (RecType (fmap (,TyKind) r), TyKind)
   RefType t         -> (RefType (t, TyKind), TyKind)
   TypeApp t xs      -> (TypeApp (t, tk) (map (,TyKind) xs), TyKind)
@@ -184,6 +186,15 @@ checkKindEq k1 k2 | k1 == k2  = return ()
 
 -- === type-checking pass on FExpr ===
 
+instance HasType Pat where
+  getEffType (RecPat p)  = getEffType p
+  getEffType (LSumPat v t) = pureType $ SumTy (varAnn v) t
+  getEffType (RSumPat t v) = pureType $ SumTy t (varAnn v)
+
+  checkEffType (RecPat p)    = checkEffType p
+  checkEffType (LSumPat v t) = (return . pureType . TC . SumType . (,t)) =<< checkVar v
+  checkEffType (RSumPat t v) = (return . pureType . TC . SumType . (t,)) =<< checkVar v
+
 instance HasType (RecTree Var) where
   getEffType tree = pureType $ case tree of
     RecLeaf v -> varAnn v
@@ -239,7 +250,7 @@ getFLamType (FLamExpr p body) = makePi v $ getEffType body
 checkTypeFlam :: FLamExpr -> TypeM (PiType EffectiveType)
 checkTypeFlam (FLamExpr p body) = do
   void $ checkKind pTy
-  bodyTy <- extendR (foldMap lbind p) $ checkEffType body
+  bodyTy <- extendR (bifoldMap lbind (const mempty) p) $ checkEffType body
   return $ makePi v bodyTy
   where pTy = getType p
         v = getPatName p :> pTy
@@ -249,7 +260,7 @@ checkTypeFDecl decl = case decl of
   LetMono p rhs -> do
     (eff, ty) <- checkEffType rhs
     assertEq (getType p) ty "LetMono"
-    return (eff, foldMap lbind p)
+    return (eff, bifoldMap lbind (const mempty) p)
   LetPoly b@(_:>ty) tlam -> do
     ty' <- checkTypeFTLam tlam
     assertEq ty ty' "TLam"
@@ -593,6 +604,8 @@ traverseConType con eq kindIs _ = case con of
   Lam l eff (Pi a (eff', b)) -> do
     checkExtends eff eff'
     return $ ArrowType l (Pi a (eff, b))
+  SumCon t' t s -> if s then return $ TC $ SumType (t', t)
+                        else return $ TC $ SumType (t, t')
   RecCon r -> return $ RecTy r
   AFor n a -> return $ TabTy n a
   AGet (ArrayTy _ b) -> return $ BaseTy b  -- TODO: check shape matches AFor scope
@@ -760,7 +773,7 @@ checkLinFDecl :: FDecl -> LinCheckM (Env Spent)
 checkLinFDecl decl = case decl of
   LetMono p rhs -> do
     ((), spent) <- captureSpent $ checkLinFExpr rhs
-    return $ foldMap (@>spent) p
+    return $ bifoldMap (@>spent) (const mempty) p
   LetPoly _ (FTLam _ _ expr) -> do
     void $ checkLinFExpr expr
     return mempty
@@ -777,10 +790,10 @@ checkLinOp e = case e of
   App NonLin fun x -> tensCheck (check fun) (withoutLin (check x))
   For _ (FLamExpr _ body) -> checkLinFExpr body
   TabGet x i -> tensCheck (check x) (withoutLin (check i))
-  RunReader r (FLamExpr ~(RecLeaf v) body) -> do
+  RunReader r (FLamExpr ~(RecPat (RecLeaf v)) body) -> do
     ((), spent) <- captureSpent $ checkLinFExpr r
     extendR (v @> spent) $ checkLinFExpr body
-  RunWriter (FLamExpr ~(RecLeaf v) body) -> do
+  RunWriter (FLamExpr ~(RecPat (RecLeaf v)) body) -> do
     ((), spent) <- captureEffSpent v $ checkLinFExpr body
     spend spent
   PrimEffect ref m -> case m of
@@ -799,7 +812,7 @@ checkLinCon e = case e of
   Lam Lin    _ (FLamExpr p body) -> do
     let v = getPatName p
     let s = asSpent v
-    withLocalLinVar v $ extendR (foldMap (@>s) p) $ checkLinFExpr body
+    withLocalLinVar v $ extendR (bifoldMap (@>s) (const mempty) p) $ checkLinFExpr body
   RecCon r -> mapM_ check r
   _ -> void $ withoutLin $ traverseExpr e pure check checkLinFLam
   where check = checkLinFExpr
@@ -832,10 +845,12 @@ checkLinVar v = do
     Nothing -> spend mempty
     Just s  -> spend s
 
-getPatName :: RecTree Var -> Name
-getPatName (RecLeaf (v:>_)) = v
-getPatName p = case toList p of (v:>_):_ -> v
-                                _        -> NoName
+getPatName :: Pat -> Name
+getPatName (RecPat (RecLeaf (v:>_))) = v
+getPatName (RecPat p) = case toList p of (v:>_):_ -> v
+                                         _        -> NoName
+getPatName (LSumPat (v:>_) _) = v
+getPatName (RSumPat _ (v:>_)) = v
 
 spend :: Spent -> LinCheckM ()
 spend s = LinCheckM $ return ((), (s, mempty))
