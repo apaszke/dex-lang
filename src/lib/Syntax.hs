@@ -25,8 +25,8 @@ module Syntax (
     RuleAnn (..), CmdName (..), Val, TopInfEnv, TopSimpEnv, TopEnv (..),
     ModuleP (..), ModuleType, Module, FModule, ImpFunction (..),
     ImpProg (..), ImpStatement, ImpInstr (..), IExpr (..), IVal, IPrimOp,
-    IVar, IType (..), ArrayType, IArrayType, SetVal (..), MonMap (..), LitProg,
-    SrcCtx, Result (..), Output (..), OutFormat (..), DataFormat (..),
+    IVar, IType (..), ArrayType, IDimType (..), IArrayType, SetVal (..), MonMap (..),
+    LitProg, SrcCtx, Result (..), Output (..), OutFormat (..), DataFormat (..),
     Err (..), ErrType (..), Except, throw, throwIf, modifyErr, addContext,
     addSrcContext, catchIOExcept, liftEitherIO, (-->), (--@), (==>), LorT (..),
     fromL, fromT, FullEnv, sourceBlockBoundVars, PassName (..), parsePassName,
@@ -41,9 +41,9 @@ module Syntax (
     pattern IntVal, pattern UnitTy, pattern PairTy, pattern TupTy,
     pattern TabTy, pattern NonLin, pattern Lin, pattern FixedIntRange,
     pattern RefTy, pattern BoolTy, pattern IntTy, pattern RealTy,
-    pattern RecTy, pattern SumTy, pattern ArrayTy, pattern BaseTy, pattern UnitVal,
-    pattern PairVal, pattern TupVal, pattern RecVal, pattern SumVal,
-    pattern RealVal, pattern BoolVal)
+    pattern RecTy, pattern SumTy, pattern IArrayTy, pattern ArrayTy,
+    pattern BaseTy, pattern UnitVal, pattern PairVal, pattern TupVal,
+    pattern RecVal, pattern SumVal, pattern RealVal, pattern BoolVal)
   where
 
 import qualified Data.Map.Strict as M
@@ -80,6 +80,12 @@ data Type = TypeVar TVar
 data TyCon ty e = BaseType BaseType
                 | IntRange e e
                 | IndexRange ty (Limit e) (Limit e)
+                -- NOTE: This is just a hack so that we can construct an Atom from an IExpr.
+                --       In the future it might make sense to parametrize Atoms by the types
+                --       of values they can hold.
+                | IArrayType IArrayType
+                -- NOTE: Similarly to IArrayType, this is only used in TopLevel, to store the
+                --       output arrays wrapped in atoms.
                 | ArrayType ArrayType
                 | RecType (Record ty)
                 | SumType (ty, ty)
@@ -198,7 +204,7 @@ data PrimExpr ty e lam = OpExpr  (PrimOp ty e lam)
 
 data PrimCon ty e lam =
         Lit LitVal
-      | ArrayLit Array
+      | ArrayLit Array     -- Only used to keep results of module evaluation
       | Lam ty ty lam      -- First type for linearity, second for effects
       | AnyValue ty        -- Produces an arbitrary value of a given type
       | SumCon e e e       -- (bool constructor tag (True is Left), left value, right value)
@@ -218,8 +224,6 @@ data PrimOp ty e lam =
       | RecGet e RecField
       | SumGet e Bool
       | SumTag e
-      | ArrayGep e e
-      | LoadScalar e
       | TabCon ty ty [e]
       | ScalarBinOp ScalarBinOp e e
       | ScalarUnOp ScalarUnOp e
@@ -347,7 +351,7 @@ addBlockIdModule bid (Module _ ty body) = Module (Just bid) ty body
 -- === imperative IR ===
 
 -- TODO: add args
-data ImpFunction = ImpFunction [IVar] [IVar] ImpProg  -- destinations first
+data ImpFunction = ImpFunction [IVar] [IVar] [IVar] ImpProg  -- destinations, destination shapes, inputs
                    deriving (Show, Eq)
 newtype ImpProg = ImpProg [ImpStatement]
                   deriving (Show, Eq, Generic, Semigroup, Monoid)
@@ -359,7 +363,7 @@ data ImpInstr = Load  IExpr
               | Alloc IArrayType
               | Free IVar
               | IGet IExpr Index
-              | Loop Direction IVar Size ImpProg
+              | Loop Direction IVar IExpr ImpProg
               | IPrimOp IPrimOp
                 deriving (Show, Eq)
 
@@ -374,9 +378,11 @@ data IType = IValType BaseType
            | IRefType IArrayType
               deriving (Show, Eq)
 
-type IArrayType = (BaseType, [Size])
+data IDimType = IUniform IExpr
+              | IPrecomputed IVar -- IVar with type IRefType ([IUniform n], IntType)
+                deriving (Show, Eq)
+type IArrayType = ([IDimType], BaseType)
 
-type Size  = IExpr
 type Index = IExpr
 
 -- === some handy monoids ===
@@ -722,8 +728,6 @@ instance TraversableExpr PrimOp where
     RecGet e i           -> liftA2 RecGet (fE e) (pure i)
     SumGet e s           -> liftA2 SumGet (fE e) (pure s)
     SumTag e             -> liftA  SumTag (fE e)
-    ArrayGep e i         -> liftA2 ArrayGep (fE e) (fE i)
-    LoadScalar e         -> liftA  LoadScalar (fE e)
     ScalarBinOp op e1 e2 -> liftA2 (ScalarBinOp op) (fE e1) (fE e2)
     ScalarUnOp  op e     -> liftA  (ScalarUnOp  op) (fE e)
     VSpaceOp ty VZero    -> liftA2 VSpaceOp (fT ty) (pure VZero)
@@ -801,6 +805,7 @@ traverseTyCon con fTy fE = case con of
   BaseType b        -> pure $ BaseType b
   IntRange a b      -> liftA2 IntRange (fE a) (fE b)
   IndexRange t a b  -> liftA3 IndexRange (fTy t) (traverse fE a) (traverse fE b)
+  IArrayType t      -> pure $ IArrayType t
   ArrayType t       -> pure $ ArrayType t
   SumType (l, r)    -> liftA SumType $ liftA2 (,) (fTy l) (fTy r)
   RecType r         -> liftA RecType $ traverse fTy r
@@ -863,7 +868,10 @@ pattern UnitTy = TupTy []
 pattern TabTy :: Type -> Type -> Type
 pattern TabTy a b = TabType (Pi a b)
 
-pattern ArrayTy :: [Int] -> BaseType -> Type
+pattern IArrayTy :: [IDimType] -> BaseType -> Type
+pattern IArrayTy shape b = TC (IArrayType (shape, b))
+
+pattern ArrayTy :: [DimType] -> BaseType -> Type
 pattern ArrayTy shape b = TC (ArrayType (shape, b))
 
 pattern BaseTy :: BaseType -> Type

@@ -109,6 +109,7 @@ tyConKind con = case con of
   -- This forces us to specialize to `TyCon Type e` instead of `TyCon ty e`
   IndexRange t a b  -> (IndexRange (t, TyKind) (fmap (,t) a)
                                                (fmap (,t) b), TyKind)
+  IArrayType t      -> (IArrayType t, TyKind)
   ArrayType t       -> (ArrayType t, TyKind)
   SumType (l, r)    -> (SumType ((l, TyKind), (r, TyKind)), TyKind)
   RecType r         -> (RecType (fmap (,TyKind) r), TyKind)
@@ -549,10 +550,6 @@ traverseOpType op eq kindIs inClass = case fmapExpr op id snd id of
   RecGet (RecTy r) i -> return $ pureType $ recGet r i
   SumGet (SumTy l r) isLeft -> return $ pureType $ if isLeft then l else r
   SumTag (SumTy _ _) -> return $ pureType $ TC $ BaseType BoolType
-  ArrayGep (ArrayTy (_:shape) b) i -> do
-    eq IntTy i
-    return $ pureType $ ArrayTy shape b
-  LoadScalar (ArrayTy [] b) -> return $ pureType $ BaseTy b
   ScalarBinOp binop t1 t2 -> do
     eq (BaseTy t1') t1
     eq (BaseTy t2') t2
@@ -601,7 +598,7 @@ traverseConType :: MonadError Err m
                      -> m Type
 traverseConType con eq kindIs _ = case con of
   Lit l    -> return $ BaseTy $ litType l
-  ArrayLit (Array (shape, b) _) -> return $ ArrayTy shape b
+  ArrayLit (Array (dims, b) _) -> return $ ArrayTy dims b
   Lam l eff (Pi a (eff', b)) -> do
     checkExtends eff eff'
     return $ ArrowType l (Pi a (eff, b))
@@ -609,7 +606,8 @@ traverseConType con eq kindIs _ = case con of
   SumCon _ l r -> return $ SumTy l r
   RecCon r -> return $ RecTy r
   AFor n a -> return $ TabTy n a
-  AGet (ArrayTy _ b) -> return $ BaseTy b  -- TODO: check shape matches AFor scope
+  AGet (ArrayTy _ b)  -> return $ BaseTy b  -- TODO: check shape matches AFor scope
+  AGet (IArrayTy _ b) -> return $ BaseTy b  -- TODO: check shape matches AFor scope
   AsIdx n e -> eq e (BaseTy IntType) >> return n
   Todo ty -> kindIs TyKind ty >> return ty
   _ -> error $ "Unexpected primitive type: " ++ pprint con
@@ -645,10 +643,24 @@ unOpType op = case op of
 
 indexSetConcreteSize :: Type -> Maybe Int
 indexSetConcreteSize ty = case ty of
-  FixedIntRange low high -> Just $ high - low
+  TC (IntRange low high) -> do
+    l <- loadBound low
+    h <- loadBound high
+    Just $ h - l
   BoolTy  -> Just 2
   RecTy r -> liftM product $ mapM indexSetConcreteSize $ toList r
+  SumTy l r -> do
+    ls <- indexSetConcreteSize l
+    rs <- indexSetConcreteSize r
+    Just $ ls + rs
   _ -> Nothing
+  where
+    loadBound :: Atom -> Maybe Int
+    loadBound (IntVal n) = Just n
+    loadBound (Con (AGet (Con (ArrayLit arr)))) = do
+      (IntLit n) <- scalarFromArray arr
+      return n
+    loadBound _ = Nothing
 
 -- === Pi types ===
 

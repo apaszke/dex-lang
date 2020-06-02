@@ -192,12 +192,16 @@ traverseArrayLeaves atom f = case atom of
 
 typeToJType :: Type -> JType
 typeToJType ty = case ty of
-  ArrayTy shape b -> JType shape b
+  ArrayTy dims b -> JType (fmap castUniform dims) b
   _ -> error $ "Not a jax type: " ++ pprint ty
+
+castUniform :: DimType -> Int
+castUniform (Uniform sz)    = sz
+castUniform (Precomputed _) = error "Ragged dims not supported"
 
 jTypeToType :: JType -> Type
 jTypeToType ty = case ty of
-  JType shape b -> ArrayTy shape b
+  JType shape b -> ArrayTy (fmap Uniform shape) b
 
 emitOp :: JOpP IdxAtom -> JaxM IdxAtom
 emitOp op = do
@@ -458,7 +462,7 @@ checkIdxEnv (i:idxs) (i':idxEnv)
 instance HasJType JAtom where
   getJType atom = case atom of
     JVar (_:> ty) -> ty
-    JLit (Array (shape, b) _) -> JType shape b
+    JLit (Array (shape, b) _) -> JType (fmap castUniform shape) b
 
   checkJType (env,_) atom = case atom of
     JVar v@(_:> ty) -> do
@@ -467,7 +471,7 @@ instance HasJType JAtom where
           assertEq reqTy ty "JVar"
           return ty
         _ -> throw CompilerErr $ "Lookup failed: " ++ pprint v
-    JLit (Array (shape, b) _) -> return $ JType shape b
+    JLit (Array (shape, b) _) -> return $ JType (fmap castUniform shape) b
 
 instance (Pretty a, HasJType a) => HasJType (JOpP a) where
   getJType op = ignoreExcept $ addContext ("Getting type of: " ++ pprint op) $
@@ -693,6 +697,9 @@ instance FromJSON BaseType
 
 instance ToJSON   Array
 instance FromJSON Array
+
+instance ToJSON   DimType
+instance FromJSON DimType
 
 instance ToJSON   Vec
 instance FromJSON Vec

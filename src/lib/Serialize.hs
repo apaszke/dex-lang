@@ -86,7 +86,7 @@ serializeHeader (DBOHeader ty sizes) =  "type: "        <> pprint ty    <> "\n"
 
 createHeader :: Type -> [ArrayRef] -> DBOHeader
 createHeader ty arrays = DBOHeader ty sizes
-  where sizes = [8 * product shape | ArrayRef (shape, _) _ <- arrays]
+  where sizes = [sizeOf b * elemCount dimTypes | ArrayRef (dimTypes, b) _ <- arrays]
 
 putBytes :: Handle -> String -> IO ()
 putBytes h s = B.hPut h $ B.pack s
@@ -114,13 +114,13 @@ parseHeader = do
   return $ DBOHeader ty sizes
 
 writeArrayToFile :: Handle -> ArrayRef -> IO ()
-writeArrayToFile h (ArrayRef (shape, _) ptr) = hPutBuf h ptr (size * 8)
-  where size = product shape
+writeArrayToFile h (ArrayRef (dimTypes, b) ptr) = hPutBuf h ptr (size * sizeOf b)
+  where size = elemCount dimTypes
 
 validateFile :: Int -> Int -> DBOHeader -> Except ()
 validateFile headerLength fileLength header@(DBOHeader ty sizes) =
   addContext ctx $ do
-     let minSizes = [product shape * 8 | (_, shape) <- flattenType ty]
+     let minSizes = [elemCount dimTypes * (sizeOf b) | (dimTypes, b) <- flattenType ty]
      when (length minSizes /= length sizes) $ throw DataIOErr $
        "unexpected number of buffers: " <> show minSizes <> " vs " <> show sizes <> "\n"
      zipWithM_ checkBufferSize minSizes sizes
@@ -155,8 +155,8 @@ reStructureArrays' ty = error $ "Not implemented: " ++ pprint ty
 
 valFromPtrs :: Type -> [Ptr ()] -> IO Val
 valFromPtrs ty ptrs = do
-  arrays <- forM (zip ptrs arrTys) $ \(ptr, (b, shape)) -> do
-              x <- loadArray $ ArrayRef (shape, b) ptr
+  arrays <- forM (zip ptrs arrTys) $ \(ptr, arrTy) -> do
+              x <- loadArray $ ArrayRef arrTy ptr
               return $ Con $ ArrayLit x
   return $ reStructureArrays ty arrays
   where arrTys = flattenType ty
@@ -224,14 +224,18 @@ liftExceptIO :: Except a -> IO a
 liftExceptIO (Left e ) = throwIO e
 liftExceptIO (Right x) = return x
 
-flattenType :: Type -> [(BaseType, [Int])]
-flattenType (FixedIntRange _ _) = [(IntType, [])]
-flattenType (TabTy (FixedIntRange low high) a) =
-    [(b, (high - low):shape) | (b, shape) <- flattenType a]
+flattenType :: Type -> [ArrayType]
+flattenType (FixedIntRange _ _) = [([], IntType)]
+flattenType (TabTy (FixedIntRange low high) a) = do
+  (subDims, b) <- flattenType a
+  let dim = Uniform (high - low)
+  return (dim:subDims, b)
 -- temporary hack. TODO: fix
-flattenType (TabTy _ a) = [(b, 0:shape) | (b, shape) <- flattenType a]
+flattenType (TabTy _ a) = do
+  (subDims, b) <- flattenType a
+  return (Uniform 0:subDims, b)
 flattenType (TC con) = case con of
-  BaseType b  -> [(b, [])]
+  BaseType b  -> [([], b)]
   RecType r -> concat $ map flattenType $ toList r
   _ -> error $ "Unexpected type: " ++ show con
 flattenType ty = error $ "Unexpected type: " ++ show ty

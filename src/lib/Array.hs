@@ -9,8 +9,8 @@
 
 module Array (
   BaseType (..), LitVal (..), ArrayType, Array (..), ArrayRef (..),
-  Vec (..), subArray, scalarFromArray, arrayFromScalar,
-  loadArray, storeArray, subArrayRef, newArrayRef, storeArrayNew) where
+  Vec (..), DimType (..), subArray, scalarFromArray, arrayFromScalar,
+  loadArray, storeArray, newArrayRef, storeArrayNew, sizeOf, elemCount) where
 
 import Control.Monad
 import Control.Monad.Primitive (PrimState)
@@ -42,16 +42,40 @@ data VecRef = IntVecRef    (V.MVector (PrimState IO) Int)
 data BaseType = IntType | BoolType | RealType | StrType
                 deriving (Show, Eq, Generic)
 
-type ArrayType = ([Int], BaseType)
+-- NOTE: The precomputed array of strides has n+1 elements for a dimension of size n!
+-- NOTE: Strides are in elements, not in bytes
+data DimType = Uniform Int
+             | Precomputed (V.Vector Int)
+           deriving (Show, Eq, Generic)
+type ArrayType = ([DimType], BaseType)
+
+offsetTo :: [DimType] -> Int -> Int
+offsetTo (d:td) i = case d of
+  Uniform _       -> i * elemCount td
+  Precomputed vec -> vec V.! i
+offsetTo [] 0 = 0
+offsetTo [] _ = error "Non-zero index used on a scalar array"
+
+sizeAt :: [DimType] -> Int -> Int
+sizeAt (d:td) i = case d of
+  Uniform _       -> elemCount td
+  Precomputed vec -> vec V.! (i+1) - vec V.! i
+sizeAt [] _ = error "Can't index into a scalar array"
+
+elemCount :: [DimType] -> Int
+elemCount (d:td) = case d of
+  Uniform sz      -> sz * elemCount td
+  Precomputed vec -> V.last vec
+elemCount [] = 1
 
 sizeOf :: BaseType -> Int
 sizeOf _ = 8
 
 subArray :: Int -> Array -> Array
-subArray i (Array ((_:shape), b) vec) = Array (shape, b) vec'
-  where size = product shape
-        offset = i * size
-        vec' = case vec of
+subArray i (Array (dims@(_:_), b) vec) = Array (tail dims, b) vec'
+  where offset = dims `offsetTo` i
+        size   = dims `sizeAt` i
+        vec'   = case vec of
                  IntVec    xs -> IntVec    $ V.slice offset size xs
                  DoubleVec xs -> DoubleVec $ V.slice offset size xs
 subArray _ _ = error "Can't get subarray of rank-0 array"
@@ -74,12 +98,12 @@ arrayFromScalar val = case val of
   _ -> error "Not implemented"
 
 loadArray :: ArrayRef -> IO Array
-loadArray (ArrayRef ty@(shape,b) ptr) = liftM (Array ty) $ case b of
+loadArray (ArrayRef ty@(dims,b) ptr) = liftM (Array ty) $ case b of
   IntType  -> liftM IntVec    $ peekVec size $ castPtr ptr
   BoolType -> liftM IntVec    $ peekVec size $ castPtr ptr
   RealType -> liftM DoubleVec $ peekVec size $ castPtr ptr
   _ -> error "Not implemented"
-  where size = product shape
+  where size = elemCount dims
 
 storeArray :: ArrayRef -> Array -> IO ()
 storeArray (ArrayRef _ ptr) (Array _ vec) = case vec of
@@ -94,15 +118,10 @@ pokeVec ptr v = forM_ [0..(V.length v - 1)] $ \i -> do
   x <- V.indexM v i
   poke (ptr `advancePtr` i) x
 
-subArrayRef :: Int -> ArrayRef -> ArrayRef
-subArrayRef i (ArrayRef ty@((_:shape), b) ptr) = ArrayRef ty ptr'
-  where ptr' = ptr `advancePtr` (i * product shape * sizeOf b)
-subArrayRef _ _ = error "Can't get subarray of rank-0 array"
-
 -- TODO: free
 newArrayRef :: ArrayType -> IO ArrayRef
-newArrayRef ty@(shape, b) = do
-  ptr <- mallocBytes $ product shape * sizeOf b
+newArrayRef ty@(dims, b) = do
+  ptr <- mallocBytes $ elemCount dims * sizeOf b
   return $ ArrayRef ty ptr
 
 storeArrayNew :: Array -> IO ArrayRef

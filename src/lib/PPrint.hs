@@ -21,6 +21,7 @@ import Data.Text (unpack)
 import System.Console.ANSI
 
 import Env
+import Array
 import Syntax
 
 pprint :: Pretty a => a -> String
@@ -90,7 +91,8 @@ instance Pretty ty => Pretty (TyCon ty Atom) where
     SumType (l, r) -> "Either" <+> p l <+> p r
     RefType t      -> "Ref" <+> p t
     TypeApp f xs   -> p f <+> hsep (map p xs)
-    ArrayType (shape, b) -> p b <> p shape
+    IArrayType (dims, b) -> p b <> p dims <> "i"
+    ArrayType  (dims, b) -> p b <> p dims
     -- This rule forces us to specialize to Atom. Is there a better way?
     IntRange (IntVal 0) (IntVal n) -> p n
     IntRange a b -> p a <> "...<" <> p b
@@ -104,6 +106,10 @@ instance Pretty ty => Pretty (TyCon ty Atom) where
                              Unlimited      -> "."
     LinCon    -> "Lin"
     NonLinCon -> "NonLin"
+
+instance Pretty DimType where
+  pretty (Uniform sz)    = p sz
+  pretty (Precomputed _) = "<precomputed>"
 
 instance Pretty b => Pretty (PiType b) where
   pretty (Pi a b) = "Pi" <+> p a <+> p b
@@ -164,8 +170,6 @@ instance (Pretty ty, Pretty e, PrettyLam lam) => Pretty (PrimOp ty e lam) where
   pretty (TabCon _ _ xs) = list (map pretty xs)
   pretty (TabGet   x i) = p x <> "." <> p i
   pretty (RecGet   x i) = p x <> "#" <> p i
-  pretty (ArrayGep x i) = p x <> "." <> p i
-  pretty (LoadScalar x) = "load(" <> p x <> ")"
   pretty (Cmp cmpOp _ x y) = "%cmp" <> p (show cmpOp) <+> p x <+> p y
   pretty (Select ty b x y) = "%select @" <> p ty <+> p b <+> p x <+> p y
   pretty (FFICall s _ _ xs) = "%%" <> p s <+> tup xs
@@ -270,16 +274,22 @@ instance Pretty IExpr where
   pretty (IVar (v:>_)) = p v
 
 instance Pretty IType where
-  pretty (IRefType (ty, shape)) = "Ptr (" <> p ty <> p shape <> ")"
+  pretty (IRefType (dimTypes, ty)) = "Ptr (" <> p ty <> p dimTypes <> ")"
   pretty (IValType b) = p b
+
+instance Pretty IDimType where
+  pretty (IUniform (ILit (IntLit sz))) = p sz
+  pretty (IUniform _)     = "<uniform, dependent>"
+  pretty (IPrecomputed _) = "<precomptued>"
 
 instance Pretty ImpProg where
   pretty (ImpProg block) = vcat (map prettyStatement block)
 
 instance Pretty ImpFunction where
-  pretty (ImpFunction vsOut vsIn body) =
-                   "in:  " <> p vsIn
-    <> hardline <> "out: " <> p vsOut
+  pretty (ImpFunction vsOut vsOutShape vsIn body) =
+                   "in:        " <> p vsIn
+    <> hardline <> "out:       " <> p vsOut
+    <> hardline <> "out shape: " <> p vsOutShape
     <> hardline <> p body
 
 prettyStatement :: (Maybe IVar, ImpInstr) -> Doc ann

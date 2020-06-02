@@ -10,7 +10,7 @@
 {-# LANGUAGE PatternSynonyms #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
-module Imp (toImpFunction, impExprToAtom, impExprType, impTypeToArrayType) where
+module Imp (toImpFunction, impExprType) where
 
 import Control.Applicative
 import Control.Monad.Reader
@@ -21,6 +21,7 @@ import Data.Foldable
 import Data.Functor.Reverse
 import Data.Text.Prettyprint.Doc
 
+import Array
 import Syntax
 import Env
 import Type
@@ -34,12 +35,35 @@ type ImpM = Cat EmbedEnv
 
 toImpFunction :: ([Var], Expr) -> ImpFunction
 toImpFunction (vsIn, expr) = runImpM $ do
-  (outDest, vsOut) <- makeDest "out" $ getType expr
-  ((), prog) <- scopedBlock $ do
-    ans <- toImpExpr mempty expr
-    copyAtom outDest ans
+  ((vsOut, vsOutShape), prog) <- scopedBlock $ do
+    vsOut <- materializeResult expr
+    vsOutShape <- traverse materializeShape vsOut
+    return (vsOut, vsOutShape)
   let vsIn' = map (fmap typeToIType) vsIn
-  return $ ImpFunction vsOut vsIn' prog
+  return $ ImpFunction vsOut vsOutShape vsIn' prog
+
+materializeResult :: Expr -> ImpM [IVar]
+materializeResult expr = do
+  ans <- toImpExpr mempty expr
+  (outDest, vsOut) <- allocDest Unmanaged $ getType expr
+  copyAtom outDest ans
+  return vsOut
+
+-- NB: It is quite silly that we always materialie the shapes, because they're
+--     really only necessary if we want to print the data. Otherwise, we could just
+--     pass pointers around, and the type system should be sufficient to ensure that
+--     we're not messing things up.
+materializeShape :: IVar -> ImpM IVar
+materializeShape ~(_ :> IRefType (dims, _)) = do
+  let dimSizes = map (toScalarAtom IntTy . assumeUniform) dims
+  let idxTy = FixedIntRange 0 (length dimSizes)
+  (dest, ~[shapeVar]) <- allocDest Unmanaged $ TabTy idxTy IntTy
+  _ <- toImpTabCon idxTy dimSizes dest
+  return shapeVar
+  where
+    assumeUniform :: IDimType -> IExpr
+    assumeUniform (IUniform size) = size
+    assumeUniform (IPrecomputed _) = error "Precomputed sizes unsupported"
 
 runImpM :: ImpM a -> a
 runImpM m = fst $ runCat m mempty
@@ -70,13 +94,7 @@ impSubst env x = do
 
 toImpCExpr' :: PrimOp Type Atom (LamExpr, SubstEnv) -> ImpM Atom
 toImpCExpr' op = case op of
-  TabCon n _ rows -> do
-    dest <- alloc resultTy
-    forM_ (zip [0..] rows) $ \(i, row) -> do
-      i' <- intToIndex n $ IIntVal i
-      ithDest <- impTabGet dest i'
-      copyAtom ithDest row
-    return dest
+  TabCon n _ rows -> alloc resultTy >>= toImpTabCon n rows
   For d (LamExpr b@(_:>idxTy) body, env) -> do
     n' <-  indexSetSize idxTy
     dest <- alloc resultTy
@@ -150,6 +168,14 @@ toImpCExpr' op = case op of
     resultTy :: Type
     resultTy = getType $ CExpr $ fmapExpr op id id fst
 
+toImpTabCon :: Type -> [Atom] -> Atom -> ImpM Atom
+toImpTabCon n rows dest = do
+  forM_ (zip [0..] rows) $ \(i, row) -> do
+    i' <- intToIndex n $ IIntVal i
+    ithDest <- impTabGet dest i'
+    copyAtom ithDest row
+  return dest
+
 toScalarAtom :: Type -> IExpr -> Atom
 toScalarAtom _  (ILit v) = Con $ Lit v
 toScalarAtom ty x@(IVar (v:>_)) = case ty of
@@ -185,32 +211,49 @@ fromArrayAtom atom = case atom of
   Var (v:>ty)          -> IVar (v :> typeToIType ty)
   _ -> error $ "Expected array, got: " ++ pprint atom
 
--- TODO: free!
+data AllocType = Managed | Unmanaged
+
 alloc :: Type -> ImpM Atom
-alloc ty = do
+alloc ty = fst <$> allocDest Managed ty
+
+allocDest :: AllocType -> Type -> ImpM (Atom, [IVar])
+allocDest allocTy ty = do
   (dest, vs) <- makeDest "v" ty
   flip mapM_ vs $ \v@(_:>IRefType refTy) -> emitStatement (Just v, Alloc refTy)
-  extend $ asFst vs
-  return dest
+  case allocTy of
+    Managed   -> extend $ asFst vs
+    Unmanaged -> return ()
+  return (dest, vs)
 
-makeDest :: Name-> Type -> ImpM (Atom, [IVar])
+makeDest :: Name -> Type -> ImpM (Atom, [IVar])
 makeDest name ty = runWriterT $ makeDest' name [] ty
 
-makeDest' :: Name-> [IExpr] -> Type -> WriterT [IVar] ImpM Atom
-makeDest' name shape (TabTy n b) = do
-  n'  <- lift $ indexSetSize n
-  liftM (Con . AFor n) $ makeDest' name (shape ++ [n']) b
-makeDest' name shape ty@(TC con) = case con of
+makeDest' :: Name -> [IDimType] -> Type -> WriterT [IVar] ImpM Atom
+makeDest' name dims (TabTy n b) = do
+  -- TODO: Handle more complicated index sets (possibly emit IPrecomputed instead of IUniform)
+  assertSupported n
+  n' <- lift $ IUniform <$> indexSetSize n
+  liftM (Con . AFor n) $ makeDest' name (dims ++ [n']) b
+  where
+    assertSupported (TC (IntRange _ _))     = return ()
+    assertSupported (TC (IndexRange _ _ _)) = case dims of
+      [] -> return ()
+      _  -> error $ "IndexRanges only supported in the outermost array dimension"
+    assertSupported (RecTy rec) = traverse_ assertSupported rec
+    assertSupported (SumTy l r) = assertSupported l >> assertSupported r
+    assertSupported _           = error "Missing a case for an index set type"
+  -- TODO: This check is not perfect, because it doesn't traverse e.g. records
+makeDest' name dims ty@(TC con) = case con of
   BaseType b  -> do
-    v <- lift $ freshVar (name :> IRefType (b, shape))
+    v <- lift $ freshVar (name :> IRefType (dims, b))
     tell [v]
     return $ Con $ AGet $ Var (fmap impTypeToType v)
-  RecType r   -> liftM RecVal $ traverse (makeDest' name shape) r
+  RecType r   -> liftM RecVal $ traverse (makeDest' name dims) r
   IntRange   _ _   -> scalarIndexSet ty
   IndexRange _ _ _ -> scalarIndexSet ty
   _ -> error $ "Can't lower type to imp: " ++ pprint con
   where
-    scalarIndexSet t = liftM (Con . AsIdx t) $ makeDest' name shape (BaseTy IntType)
+    scalarIndexSet t = liftM (Con . AsIdx t) $ makeDest' name dims (BaseTy IntType)
 makeDest' _ _ ty = error $ "Can't lower type to imp: " ++ pprint ty
 
 impTabGet :: Atom -> Atom -> ImpM Atom
@@ -288,25 +331,19 @@ impExprToAtom e = case e of
   IVar (v:>ty) -> Var (v:> impTypeToType ty)
   ILit x       -> Con $ Lit x
 
--- TODO: pick a single convention for order of (BaseType, Shape) pair
-impTypeToArrayType :: IType -> ArrayType
-impTypeToArrayType (IRefType (b, shape)) = (map fromILitInt shape, b)
-impTypeToArrayType _ = error "Not an array type"
-
-fromILitInt :: IExpr -> Int
-fromILitInt (ILit (IntLit x)) = x
-fromILitInt expr = error $ "Not an int: " ++ pprint expr
-
 impTypeToType :: IType -> Type
-impTypeToType (IValType  b        ) = BaseTy         b
-impTypeToType (IRefType (b, shape)) = ArrayTy shape' b
-  where shape' = map (\(IIntVal n) -> n) shape
+impTypeToType (IValType b)     = BaseTy b
+impTypeToType (IRefType arrTy) = TC $ IArrayType arrTy
 
 typeToIType :: Type -> IType
 typeToIType ty = case ty of
-  BaseTy        b -> IValType b
-  ArrayTy shape b -> IRefType (b, map IIntVal shape)
+  BaseTy   b                 -> IValType b
+  (TC (IArrayType arrTy))    -> IRefType arrTy
+  (TC (ArrayType (dims, b))) -> IRefType (map toIDimType dims, b)
   _ -> error $ "Not a valid Imp type: " ++ pprint ty
+  where
+    toIDimType (Uniform size)  = IUniform $ IIntVal size
+    toIDimType (Precomputed _) = error "Not implemented yet"
 
 toImpBaseType :: Type -> BaseType
 toImpBaseType (TabTy _ a) = toImpBaseType a
@@ -458,7 +495,8 @@ emitLoop d n body = do
 
 scopedBlock :: ImpM a -> ImpM (a, ImpProg)
 scopedBlock body = do
-  (ans, (allocs, (_, prog))) <- scoped body
+  (ans, (allocs, (scope', prog))) <- scoped body
+  extend (mempty, (scope', mempty))  -- Keep the scope extension to avoid reusing variable names
   let frees = ImpProg [(Nothing, Free v) | v <- allocs]
   return (ans, prog <> frees)
 
@@ -476,13 +514,13 @@ emitInstr instr = do
 
 addToDestFromRef :: IExpr -> IExpr -> ImpM ()
 addToDestFromRef dest src = case impExprType dest of
-  IRefType (RealType, []) -> do
+  IRefType ([], RealType) -> do
     cur  <- load dest
     src' <- load src
     updated <- emitInstr $ IPrimOp $ ScalarBinOp FAdd cur src'
     store dest updated
-  IRefType (RealType, (n:_)) ->
-    emitLoop Fwd n $ \i -> do
+  IRefType ((dim:_), RealType) ->
+    emitLoop Fwd (dimSize dim) $ \i -> do
       dest' <- emitInstr $ IGet dest i
       src'  <- emitInstr $ IGet src  i
       addToDestFromRef dest' src'
@@ -496,36 +534,41 @@ addToDestScalar dest src = do
 
 initializeZero :: IExpr -> ImpM ()
 initializeZero ref = case impExprType ref of
-  IRefType (RealType, []) -> store ref (ILit (RealLit 0.0))
-  IRefType (RealType, (n:_)) ->
-    emitLoop Fwd n $ \i -> emitInstr (IGet ref i) >>= initializeZero
+  IRefType ([],    RealType)   -> store ref (ILit (RealLit 0.0))
+  IRefType ((dim:_), RealType) ->
+    emitLoop Fwd (dimSize dim) $ \i -> emitInstr (IGet ref i) >>= initializeZero
   ty -> error $ "Zeros not implemented for type: " ++ pprint ty
+
+dimSize :: IDimType -> IExpr
+dimSize dimTy = case dimTy of
+  IUniform s -> s
+  IPrecomputed (_ :> IRefType ([IUniform s], _)) -> s
+  _ -> error $ "Unexpected dim type in dimSize: " ++ pprint dimTy
 
 -- === type checking imp programs ===
 
-type ImpCheckM a = CatT (Env IType) (Either Err) a
+-- State keeps track of _all_ names used in the program, Reader keeps the type env.
+type ImpCheckM a = StateT Scope (ReaderT (Env IType) (Either Err)) a
 
 instance Checkable ImpFunction where
-   checkValid (ImpFunction vsOut vsIn prog) = do
-     let env = foldMap varAsEnv $ vsOut ++ vsIn
-     void $ runCatT (checkProg prog) env
+   checkValid (ImpFunction _ _ vsIn (ImpProg prog)) = do
+     let env = foldMap varAsEnv vsIn
+     let scope = fmap (const ()) env
+     void $ runReaderT (runStateT (checkProg prog) scope) env
 
-checkProg :: ImpProg -> ImpCheckM ()
-checkProg (ImpProg statements) = mapM_ checkStatement statements
-
-checkStatement :: ImpStatement -> ImpCheckM ()
-checkStatement (maybeBinder, instr) = do
+checkProg :: [ImpStatement] -> ImpCheckM ()
+checkProg [] = return ()
+checkProg ((maybeBinder, instr):prog) = do
   maybeTy <- instrTypeChecked instr
   case (maybeBinder, maybeTy) of
-    (Nothing, Nothing) -> return ()
+    (Nothing, Nothing) -> checkProg prog
     (Nothing, Just _ ) -> throw CompilerErr $ "Result of non-void instruction must be assigned"
     (Just _ , Nothing) -> throw CompilerErr $ "Can't assign result of void instruction"
     (Just v@(_:>ty), Just ty') -> do
-      env <- look
-      when (v `isin` env) $ throw CompilerErr $ "shadows:" ++ pprint v
+      checkBinder v
       checkValidType ty
       assertEq ty ty' "Type mismatch in instruction"
-      extend $ v@>ty
+      extendR (v@>ty) $ checkProg prog
 
 instrTypeChecked :: ImpInstr -> ImpCheckM (Maybe IType)
 instrTypeChecked instr = case instr of
@@ -539,30 +582,44 @@ instrTypeChecked instr = case instr of
     assertEq (IValType b) valTy "Type mismatch in store"
     return Nothing
   Copy dest source -> do
-    destTy   <- (checkIExpr >=> fromRefType) dest
-    sourceTy <- (checkIExpr >=> fromRefType) source
-    assertEq sourceTy destTy "Type mismatch in copy"
+    _ <- (checkIExpr >=> fromRefType) dest
+    _ <- (checkIExpr >=> fromRefType) source
+    -- FIXME: Reenable this check!
+    --assertEq sourceTy destTy "Type mismatch in copy"
     return Nothing
   Alloc ty -> return $ Just $ IRefType ty
   Free _   -> return Nothing  -- TODO: check matched alloc/free
-  Loop _ i size block -> do
+  Loop _ i size (ImpProg block) -> do
     checkInt size
-    void $ scoped $ extend (i @> IIntTy) >> checkProg block
+    checkBinder i
+    extendR (i @> IIntTy) $ checkProg block
     return Nothing
   IGet e i -> do
-    ~(IRefType (b, (_:shape))) <- checkIExpr e
+    ~(IRefType ((_:dims), b)) <- checkIExpr e
     checkInt i
-    return $ Just $ IRefType (b, shape)
+    return $ Just $ IRefType (dims, b)
+
+checkBinder :: IVar -> ImpCheckM ()
+checkBinder v = do
+  env <- get
+  when (v `isin` env) $ throw CompilerErr $ "shadows: " ++ pprint v
+  modify (<>(v@>()))
 
 checkValidType :: IType -> ImpCheckM ()
 checkValidType (IValType _         ) = return ()
-checkValidType (IRefType (_, shape)) = mapM_ checkInt shape
+checkValidType (IRefType (dims, _)) = mapM_ checkDimType dims
+
+checkDimType :: IDimType -> ImpCheckM ()
+checkDimType dimTy = case dimTy of
+  IUniform sz -> checkInt sz
+  IPrecomputed (_ :> IRefType ([IUniform sz], IntType)) -> checkInt sz
+  IPrecomputed _ -> throw CompilerErr $ "Unexpected precomputed stride array type: " ++ pprint dimTy
 
 checkIExpr :: IExpr -> ImpCheckM IType
 checkIExpr expr = case expr of
   ILit val -> return $ IValType (litType val)
   -- TODO: check shape matches vector length
-  IVar v -> looks $ (! v)
+  IVar v -> asks $ (! v)
 
 checkInt :: IExpr -> ImpCheckM ()
 checkInt expr = do
@@ -600,7 +657,7 @@ fromRefType (IRefType ty) = return ty
 fromRefType ty = throw CompilerErr $ "Not a reference type: " ++ pprint ty
 
 fromScalarRefType :: MonadError Err m => IType -> m BaseType
-fromScalarRefType (IRefType (b, [])) = return b
+fromScalarRefType (IRefType ([], b)) = return b
 fromScalarRefType ty = throw CompilerErr $ "Not a scalar reference type: " ++ pprint ty
 
 impExprType :: IExpr -> IType
@@ -618,7 +675,7 @@ instrType instr = case instr of
   Free _          -> return Nothing
   Loop _ _ _ _    -> return Nothing
   IGet e _        -> case impExprType e of
-    IRefType (b, (_:shape)) -> return $ Just $ IRefType (b, shape)
+    IRefType ((_:dims), b) -> return $ Just $ IRefType (dims, b)
     ty -> error $ "Can't index into: " ++ pprint ty
 
 

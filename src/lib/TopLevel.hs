@@ -236,16 +236,16 @@ substArrayLiterals backend x = do
 
 -- TODO: think carefully about whether this is thread-safe
 execLLVM :: Logger [Output] -> LLVMEngine -> LLVMFunction -> [Var] -> IO [Var]
-execLLVM logger envRef fun@(LLVMFunction outTys _ _) inVars = do
+execLLVM logger envRef fun inVars = do
   modifyMVar envRef $ \env -> do
-    outRefs <- mapM newArrayRef outTys
     let inRefs = flip map inVars $ \v ->
                    case envLookup env v of
                      Just ref -> ref
                      Nothing  -> error "Array lookup failed"
+    outRefs <- callLLVM logger fun inRefs
+    let outTys = [ty | ArrayRef ty _ <- outRefs]
     let (outNames, env') = nameItems (Name ArrayName "arr" 0) env outRefs
     let outVars = zipWith (\v (b,shape) -> v :> ArrayTy b shape) outNames outTys
-    callLLVM logger fun outRefs inRefs
     return (env <> env', outVars)
 
 -- TODO: check here for upstream errors

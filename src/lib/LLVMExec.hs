@@ -23,6 +23,8 @@ import Foreign.Ptr
 import Foreign.Storable
 import Control.Exception
 import Control.Monad
+import Foreign.ForeignPtr
+import qualified Data.Vector.Storable as VS
 import Data.ByteString.Char8 (unpack)
 import Data.Maybe (fromMaybe)
 
@@ -36,19 +38,30 @@ foreign import ccall "threefry2x32"  linking_hack :: Int -> Int -> Int
 foreign import ccall "dynamic"
   callFunPtr :: FunPtr (Ptr () -> IO ()) -> Ptr () -> IO ()
 
-data LLVMFunction = LLVMFunction [ArrayType] [ArrayType] L.Module  -- outputs first
+-- First element holds the number of dimensions and base type of each output array
+data LLVMFunction = LLVMFunction [(Int, BaseType)] L.Module
 
--- TODO: check arg types
-callLLVM :: Logger [Output] -> LLVMFunction -> [ArrayRef] -> [ArrayRef] -> IO ()
-callLLVM logger (LLVMFunction _ _ ast) outArrays inArrays = do
-  let ioArgs = outArrays ++ inArrays
-  argsPtr <- mallocBytes $ length ioArgs * ptrSize
-  forM_ (zip [0..] ioArgs) $ \(i, ArrayRef _ p) -> do
+callLLVM :: Logger [Output] -> LLVMFunction -> [ArrayRef] -> IO [ArrayRef]
+callLLVM logger (LLVMFunction outputTys ast) inArrays = do
+  argsPtr <- mallocBytes $ numIO * ptrSize
+  -- NB: Outputs come first!
+  forM_ (zip [numOutputs..] inArrays) $ \(i, ArrayRef _ p) -> do
     poke (argsPtr `plusPtr` (i * ptrSize)) p
-  logs <- evalLLVM logger ast argsPtr
+  evalLLVM logger ast argsPtr
+  outputPtrs <- forM [0..numOutputArrays - 1] $ \i -> peek (argsPtr `plusPtr` (i * ptrSize))
+  outputTypes <- forM (zip [numOutputArrays..numOutputs - 1] outputTys) $ \(i, (ndim, b)) -> do
+    -- TODO: Free the shape!
+    shapePtr <- newForeignPtr_ =<< peek (argsPtr `plusPtr` (i * ptrSize))
+    let shape = VS.unsafeFromForeignPtr0 shapePtr ndim
+    return $ (fmap Uniform $ VS.toList shape, b)
   free argsPtr
-  return logs
-  where ptrSize = 8
+  return $ zipWith ArrayRef outputTypes outputPtrs
+  where
+    numInputs = length inArrays
+    numOutputArrays = length outputTys
+    numOutputs = numOutputArrays * 2
+    numIO = numOutputs + numInputs
+    ptrSize = 8 -- TODO: Get this from LLVM instead of hardcoding!
 
 evalLLVM :: Logger [Output] -> L.Module -> Ptr () -> IO ()
 evalLLVM logger ast argPtr = do
