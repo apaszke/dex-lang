@@ -92,7 +92,8 @@ instance Pretty ty => Pretty (TyCon ty Atom) where
     RefType t      -> "Ref" <+> p t
     TypeApp f xs   -> p f <+> hsep (map p xs)
     IArrayType (dims, b) -> p b <> p dims <> "i"
-    ArrayType  (dims, b) -> p b <> p dims
+    JArrayType dims b    -> p b <> p dims <> "j"
+    ArrayType  b         -> p b <> "*"
     -- This rule forces us to specialize to Atom. Is there a better way?
     IntRange (IntVal 0) (IntVal n) -> p n
     IntRange a b -> p a <> "...<" <> p b
@@ -106,10 +107,6 @@ instance Pretty ty => Pretty (TyCon ty Atom) where
                              Unlimited      -> "."
     LinCon    -> "Lin"
     NonLinCon -> "NonLin"
-
-instance Pretty DimType where
-  pretty (Uniform sz)    = p sz
-  pretty (Precomputed _) = "<precomputed>"
 
 instance Pretty b => Pretty (PiType b) where
   pretty (Pi a b) = "Pi" <+> p a <+> p b
@@ -286,10 +283,9 @@ instance Pretty ImpProg where
   pretty (ImpProg block) = vcat (map prettyStatement block)
 
 instance Pretty ImpFunction where
-  pretty (ImpFunction vsOut vsOutShape vsIn body) =
+  pretty (ImpFunction vsOut vsIn body) =
                    "in:        " <> p vsIn
     <> hardline <> "out:       " <> p vsOut
-    <> hardline <> "out shape: " <> p vsOutShape
     <> hardline <> p body
 
 prettyStatement :: (Maybe IVar, ImpInstr) -> Doc ann
@@ -301,6 +297,7 @@ instance Pretty ImpInstr where
   pretty (Load ref)         = "load"  <+> p ref
   pretty (Store dest val)   = "store" <+> p dest <+> p val
   pretty (Copy dest source) = "copy"  <+> p dest <+> p source
+  pretty (CastArray v t)    = "cast"  <+> p v <+> "as" <+> p t
   pretty (Alloc ty)         = "alloc" <+> p ty
   pretty (IGet expr idx)    = p expr <> "." <> p idx
   pretty (Free (v:>_))      = "free"  <+> p v
@@ -345,6 +342,13 @@ instance Pretty body => Pretty (ModuleP body) where
 instance (Pretty a, Pretty b) => Pretty (Either a b) where
   pretty (Left  x) = "Left"  <+> p x
   pretty (Right x) = "Right" <+> p x
+
+instance Pretty Array where
+  pretty a = p b <> "[" <> p size <> "]@vec"
+    where (size, b) = arrayType a
+
+instance Pretty ArrayRef where
+  pretty (ArrayRef (size, b) ptr) = p b <> "[" <> p size <> "]@" <> (pretty $ show ptr)
 
 printLitBlock :: Bool -> SourceBlock -> Result -> String
 printLitBlock isatty block (Result outs result) =

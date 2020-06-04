@@ -53,7 +53,7 @@ import Control.Monad.Identity
 import Control.Monad.Writer
 import Control.Monad.Except hiding (Except)
 import Control.Monad.Reader
-import qualified Data.Vector.Unboxed as V
+import qualified Data.Vector.Storable as V
 import Data.Foldable (fold)
 import Data.Tuple (swap)
 import Data.Maybe (fromJust)
@@ -80,13 +80,14 @@ data Type = TypeVar TVar
 data TyCon ty e = BaseType BaseType
                 | IntRange e e
                 | IndexRange ty (Limit e) (Limit e)
-                -- NOTE: This is just a hack so that we can construct an Atom from an IExpr.
+                -- NOTE: This is just a hack so that we can construct an Atom from an Imp or Jax expression.
                 --       In the future it might make sense to parametrize Atoms by the types
                 --       of values they can hold.
                 | IArrayType IArrayType
+                | JArrayType [Int] BaseType
                 -- NOTE: Similarly to IArrayType, this is only used in TopLevel, to store the
                 --       output arrays wrapped in atoms.
-                | ArrayType ArrayType
+                | ArrayType BaseType
                 | RecType (Record ty)
                 | SumType (ty, ty)
                 | RefType ty
@@ -350,8 +351,7 @@ addBlockIdModule bid (Module _ ty body) = Module (Just bid) ty body
 
 -- === imperative IR ===
 
--- TODO: add args
-data ImpFunction = ImpFunction [IVar] [IVar] [IVar] ImpProg  -- destinations, destination shapes, inputs
+data ImpFunction = ImpFunction [PtrVar] [PtrVar] ImpProg  -- destinations first
                    deriving (Show, Eq)
 newtype ImpProg = ImpProg [ImpStatement]
                   deriving (Show, Eq, Generic, Semigroup, Monoid)
@@ -361,6 +361,7 @@ data ImpInstr = Load  IExpr
               | Store IExpr IExpr  -- destination first
               | Copy  IExpr IExpr  -- destination first
               | Alloc IArrayType
+              | CastArray Var IArrayType -- Var should have ArrayType
               | Free IVar
               | IGet IExpr Index
               | Loop Direction IVar IExpr ImpProg
@@ -374,6 +375,7 @@ data IExpr = ILit LitVal
 type IPrimOp = PrimOp BaseType IExpr ()
 type IVal = IExpr  -- only ILit and IRef constructors
 type IVar = VarP IType
+type PtrVar = VarP BaseType
 data IType = IValType BaseType
            | IRefType IArrayType
               deriving (Show, Eq)
@@ -806,6 +808,7 @@ traverseTyCon con fTy fE = case con of
   IntRange a b      -> liftA2 IntRange (fE a) (fE b)
   IndexRange t a b  -> liftA3 IndexRange (fTy t) (traverse fE a) (traverse fE b)
   IArrayType t      -> pure $ IArrayType t
+  JArrayType s b    -> pure $ JArrayType s b
   ArrayType t       -> pure $ ArrayType t
   SumType (l, r)    -> liftA SumType $ liftA2 (,) (fTy l) (fTy r)
   RecType r         -> liftA RecType $ traverse fTy r
@@ -871,8 +874,8 @@ pattern TabTy a b = TabType (Pi a b)
 pattern IArrayTy :: [IDimType] -> BaseType -> Type
 pattern IArrayTy shape b = TC (IArrayType (shape, b))
 
-pattern ArrayTy :: [DimType] -> BaseType -> Type
-pattern ArrayTy shape b = TC (ArrayType (shape, b))
+pattern ArrayTy :: BaseType -> Type
+pattern ArrayTy b = TC (ArrayType b)
 
 pattern BaseTy :: BaseType -> Type
 pattern BaseTy b = TC (BaseType b)

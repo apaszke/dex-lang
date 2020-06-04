@@ -24,7 +24,7 @@ newtype Profile = Profile (M.Map String Count)
 type FlopM a = ReaderT Term (Writer Profile) a
 
 impFunctionFlops :: ImpFunction -> Profile
-impFunctionFlops (ImpFunction _ _ _ prog) =
+impFunctionFlops (ImpFunction _ _ prog) =
   snd $ runWriter (runReaderT (flops prog) (litTerm 1))
 
 flops :: ImpProg -> FlopM ()
@@ -47,6 +47,7 @@ statementFlops (_, instr) = case instr of
   Alloc _   -> return ()
   Free _    -> return ()
   IGet _ _  -> return ()
+  CastArray _ _       -> return ()
   Loop _ _ size block -> do
     let n = evalSizeExpr size
     local (mulTerm n) $ flops block

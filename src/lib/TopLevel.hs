@@ -18,6 +18,7 @@ import Control.Monad.Except hiding (Except)
 import Data.Foldable (toList)
 import Data.String
 import Data.Text.Prettyprint.Doc
+import Foreign.Ptr
 
 import Array
 import Syntax
@@ -54,7 +55,7 @@ data BackendEngine = LLVMEngine LLVMEngine
                    | JaxServer JaxServer
                    | InterpEngine
 
-type LLVMEngine = MVar (Env ArrayRef)
+type LLVMEngine = MVar (Env (Ptr ()))
 type JaxServer = PipeServer ( (JaxFunction, [JVar]) -> ([JVar], String)
                            ,( [JVar] -> [Array]
                            ,( Array -> ()  -- for debugging
@@ -193,8 +194,15 @@ evalBackend expr = do
       checkPass ImpPass impFunction
       logPass Flops $ impFunctionFlops impFunction
       let llvmFunc = impToLLVM impFunction
-      outVars <- liftIO $ execLLVM logger engine llvmFunc inVars
-      return $ reStructureArrays (getType expr) $ map Var outVars
+      let exprType = getType expr
+      lift $ modifyMVar engine $ \env -> do
+        let inPtrs = fmap (env !) inVars
+        outPtrs <- callLLVM logger llvmFunc inPtrs
+        let outTys = flattenType exprType
+        let (outNames, env') = nameItems (Name ArrayName "arr" 0) env outPtrs
+        let outVars = zipWith (\v (_, b) -> v :> ArrayTy b) outNames outTys
+        let result = reStructureArrays exprType $ map Var outVars
+        return (env <> env', result)
     JaxServer server -> do
       -- callPipeServer (psPop (psPop server)) $ arrayFromScalar (IntLit 123)
       let jfun = toJaxFunction (inVars, expr)
@@ -210,14 +218,14 @@ evalBackend expr = do
       return $ reStructureArrays (getType expr) $ map Var outVars'
     InterpEngine -> return $ evalExpr mempty expr
 
-requestArrays :: BackendEngine -> [Var] -> IO [Array]
-requestArrays _ [] = return []
-requestArrays backend vs = case backend of
+requestArrays :: BackendEngine -> [Var] -> [ArrayType] -> IO [Array]
+requestArrays _ [] [] = return []
+requestArrays backend vs arrTys = case backend of
   LLVMEngine env -> do
     env' <- readMVar env
-    forM vs $ \v -> do
+    forM (zip vs arrTys) $ \(v, arrTy) -> do
       case envLookup env' v of
-        Just ref -> loadArray ref
+        Just ref -> loadArray (ArrayRef arrTy ref)
         Nothing -> error "Array lookup failed"
   JaxServer server -> do
     let vs' = map (fmap typeToJType) vs
@@ -227,26 +235,13 @@ requestArrays backend vs = case backend of
 arrayVars :: HasVars a => a -> [Var]
 arrayVars x = [v:>ty | (v@(Name ArrayName _ _), L ty) <- envPairs (freeVars x)]
 
-substArrayLiterals :: (HasVars a, Subst a) => BackendEngine -> a -> IO a
+substArrayLiterals :: (HasVars a, HasType a, Subst a) => BackendEngine -> a -> IO a
 substArrayLiterals backend x = do
   let vs = arrayVars x
-  arrays <- requestArrays backend vs
+  let arrTys = flattenType $ getType x
+  arrays <- requestArrays backend vs arrTys
   let arrayAtoms = map (Con . ArrayLit) arrays
   return $ subst (newLEnv vs arrayAtoms, mempty) x
-
--- TODO: think carefully about whether this is thread-safe
-execLLVM :: Logger [Output] -> LLVMEngine -> LLVMFunction -> [Var] -> IO [Var]
-execLLVM logger envRef fun inVars = do
-  modifyMVar envRef $ \env -> do
-    let inRefs = flip map inVars $ \v ->
-                   case envLookup env v of
-                     Just ref -> ref
-                     Nothing  -> error "Array lookup failed"
-    outRefs <- callLLVM logger fun inRefs
-    let outTys = [ty | ArrayRef ty _ <- outRefs]
-    let (outNames, env') = nameItems (Name ArrayName "arr" 0) env outRefs
-    let outVars = zipWith (\v (b,shape) -> v :> ArrayTy b shape) outNames outTys
-    return (env <> env', outVars)
 
 -- TODO: check here for upstream errors
 typePass :: TopInfEnv -> FModule -> TopPassM (FModule, TopInfEnv)

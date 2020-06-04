@@ -110,6 +110,7 @@ tyConKind con = case con of
   IndexRange t a b  -> (IndexRange (t, TyKind) (fmap (,t) a)
                                                (fmap (,t) b), TyKind)
   IArrayType t      -> (IArrayType t, TyKind)
+  JArrayType s b    -> (JArrayType s b, TyKind)
   ArrayType t       -> (ArrayType t, TyKind)
   SumType (l, r)    -> (SumType ((l, TyKind), (r, TyKind)), TyKind)
   RecType r         -> (RecType (fmap (,TyKind) r), TyKind)
@@ -597,8 +598,9 @@ traverseConType :: MonadError Err m
                      -> (ClassName -> Type -> m ()) -- add class constraint
                      -> m Type
 traverseConType con eq kindIs _ = case con of
-  Lit l    -> return $ BaseTy $ litType l
-  ArrayLit (Array (dims, b) _) -> return $ ArrayTy dims b
+  Lit l        -> return $ BaseTy $ litType l
+  ArrayLit arr -> return $ ArrayTy b
+    where (_, b) = arrayType arr
   Lam l eff (Pi a (eff', b)) -> do
     checkExtends eff eff'
     return $ ArrowType l (Pi a (eff, b))
@@ -606,7 +608,7 @@ traverseConType con eq kindIs _ = case con of
   SumCon _ l r -> return $ SumTy l r
   RecCon r -> return $ RecTy r
   AFor n a -> return $ TabTy n a
-  AGet (ArrayTy _ b)  -> return $ BaseTy b  -- TODO: check shape matches AFor scope
+  AGet (ArrayTy b)  -> return $ BaseTy b  -- TODO: check shape matches AFor scope
   AGet (IArrayTy _ b) -> return $ BaseTy b  -- TODO: check shape matches AFor scope
   AsIdx n e -> eq e (BaseTy IntType) >> return n
   Todo ty -> kindIs TyKind ty >> return ty

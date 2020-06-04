@@ -7,7 +7,7 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Serialize (DBOHeader (..), dumpDataFile, loadDataFile, pprintVal,
-                 valToHeatmap, valToScatter, reStructureArrays) where
+                 valToHeatmap, valToScatter, reStructureArrays, flattenType) where
 
 import Control.Monad
 import Control.Monad.Writer
@@ -42,11 +42,11 @@ preHeaderStart = "-- dex-object-file-v0.0.1 num-header-bytes "
 
 dumpDataFile :: FilePath -> Val -> IO ()
 dumpDataFile fname val = do
-  arrayRefs <- mapM storeArrayNew $ getValArrays val
+  let arrays = getValArrays val
   let ty = getType val
   withFile fname WriteMode $ \h -> do
-    putBytes h $ serializeFullHeader $ createHeader ty arrayRefs
-    mapM_ (writeArrayToFile h) arrayRefs
+    putBytes h $ serializeFullHeader $ createHeader ty arrays
+    mapM_ (writeArrayToFile h) arrays
 
 loadDataFile :: FilePath -> IO Val
 loadDataFile fname = do
@@ -84,9 +84,9 @@ serializeHeader :: DBOHeader -> String
 serializeHeader (DBOHeader ty sizes) =  "type: "        <> pprint ty    <> "\n"
                                      <> "bufferSizes: " <> show sizes   <> "\n"
 
-createHeader :: Type -> [ArrayRef] -> DBOHeader
+createHeader :: Type -> [Array] -> DBOHeader
 createHeader ty arrays = DBOHeader ty sizes
-  where sizes = [sizeOf b * elemCount dimTypes | ArrayRef (dimTypes, b) _ <- arrays]
+  where sizes = [sizeOf b * elems | (elems, b) <- map arrayType arrays]
 
 putBytes :: Handle -> String -> IO ()
 putBytes h s = B.hPut h $ B.pack s
@@ -113,14 +113,14 @@ parseHeader = do
   emptyLines
   return $ DBOHeader ty sizes
 
-writeArrayToFile :: Handle -> ArrayRef -> IO ()
-writeArrayToFile h (ArrayRef (dimTypes, b) ptr) = hPutBuf h ptr (size * sizeOf b)
-  where size = elemCount dimTypes
+writeArrayToFile :: Handle -> Array -> IO ()
+writeArrayToFile h arr = unsafeWithArrayPointer arr (\ptr -> hPutBuf h ptr (size * sizeOf b))
+  where (size, b) = arrayType arr
 
 validateFile :: Int -> Int -> DBOHeader -> Except ()
 validateFile headerLength fileLength header@(DBOHeader ty sizes) =
   addContext ctx $ do
-     let minSizes = [elemCount dimTypes * (sizeOf b) | (dimTypes, b) <- flattenType ty]
+     let minSizes = [size * (sizeOf b) | (size, b) <- flattenType ty]
      when (length minSizes /= length sizes) $ throw DataIOErr $
        "unexpected number of buffers: " <> show minSizes <> " vs " <> show sizes <> "\n"
      zipWithM_ checkBufferSize minSizes sizes
@@ -166,13 +166,13 @@ type PrimConVal = PrimCon Type Atom LamExpr
 valToScatter :: Val -> Output
 valToScatter ~(Con (AFor _ body)) = ScatterOut xs ys
   where
-    ~(PairVal (Con (AGet (Con (ArrayLit (Array _ (DoubleVec xs))))))
-              (Con (AGet (Con (ArrayLit (Array _ (DoubleVec ys))))))) = body
+    ~(PairVal (Con (AGet (Con (ArrayLit (Array (DoubleVec xs))))))
+              (Con (AGet (Con (ArrayLit (Array (DoubleVec ys))))))) = body
 
 valToHeatmap :: Val -> Output
 valToHeatmap ~(Con (AFor (FixedIntRange hl hh) body)) = HeatmapOut h w xs
   where ~(Con (AFor (FixedIntRange wl wh) (Con (AGet arr)))) = body
-        ~(Con (ArrayLit (Array _ (DoubleVec xs)))) = arr
+        ~(Con (ArrayLit (Array (DoubleVec xs)))) = arr
         h = hh - hl
         w = wh - wl
 
@@ -200,10 +200,11 @@ prettyVal (Con con) = case con of
 prettyVal atom = error $ "Unexpected value: " ++ pprint atom
 
 litIndexSubst :: Int -> Atom -> Atom
-litIndexSubst i atom = case atom of
-  Con (ArrayLit x) -> Con $ ArrayLit $ subArray i x
-  Con con -> Con $ fmapExpr con id (litIndexSubst i) (error "unexpected lambda")
-  _ -> error "Unused index"
+litIndexSubst = undefined
+--litIndexSubst i atom = case atom of
+  --Con (ArrayLit x) -> Con $ ArrayLit $ subArray i x
+  --Con con -> Con $ fmapExpr con id (litIndexSubst i) (error "unexpected lambda")
+  --_ -> error "Unused index"
 
 traverseVal :: Monad m => (PrimConVal -> m (Maybe PrimConVal)) -> Val -> m Val
 traverseVal f val = case val of
@@ -225,17 +226,16 @@ liftExceptIO (Left e ) = throwIO e
 liftExceptIO (Right x) = return x
 
 flattenType :: Type -> [ArrayType]
-flattenType (FixedIntRange _ _) = [([], IntType)]
+flattenType (FixedIntRange _ _) = [(1, IntType)]
 flattenType (TabTy (FixedIntRange low high) a) = do
-  (subDims, b) <- flattenType a
-  let dim = Uniform (high - low)
-  return (dim:subDims, b)
+  (subCount, b) <- flattenType a
+  return ((high - low) * subCount, b)
 -- temporary hack. TODO: fix
 flattenType (TabTy _ a) = do
-  (subDims, b) <- flattenType a
-  return (Uniform 0:subDims, b)
+  (subCount, b) <- flattenType a
+  return (0 * subCount, b)
 flattenType (TC con) = case con of
-  BaseType b  -> [([], b)]
+  BaseType b  -> [(1, b)]
   RecType r -> concat $ map flattenType $ toList r
   _ -> error $ "Unexpected type: " ++ show con
 flattenType ty = error $ "Unexpected type: " ++ show ty

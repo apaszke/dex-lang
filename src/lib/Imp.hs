@@ -12,7 +12,7 @@
 
 module Imp (toImpFunction, impExprType) where
 
-import Control.Applicative
+import Control.Monad.Trans.Identity
 import Control.Monad.Reader
 import Control.Monad.Except hiding (Except)
 import Control.Monad.State
@@ -29,18 +29,17 @@ import PPrint
 import Cat
 import Subst
 import Record
+import Util (bindM2)
 
 type EmbedEnv = ([IVar], (Scope, ImpProg))
 type ImpM = Cat EmbedEnv
 
 toImpFunction :: ([Var], Expr) -> ImpFunction
 toImpFunction (vsIn, expr) = runImpM $ do
-  ((vsOut, vsOutShape), prog) <- scopedBlock $ do
-    vsOut <- materializeResult expr
-    vsOutShape <- traverse materializeShape vsOut
-    return (vsOut, vsOutShape)
-  let vsIn' = map (fmap typeToIType) vsIn
-  return $ ImpFunction vsOut vsOutShape vsIn' prog
+  (vsOut, prog) <- scopedBlock $ materializeResult expr
+  let arrIn  = flip fmap vsIn  (\(v :> TC (ArrayType b)) -> v :> b)
+  let arrOut = flip fmap vsOut (\(v :> IRefType (_, b))  -> v :> b)
+  return $ ImpFunction arrOut arrIn prog
 
 materializeResult :: Expr -> ImpM [IVar]
 materializeResult expr = do
@@ -48,22 +47,6 @@ materializeResult expr = do
   (outDest, vsOut) <- allocDest Unmanaged $ getType expr
   copyAtom outDest ans
   return vsOut
-
--- NB: It is quite silly that we always materialie the shapes, because they're
---     really only necessary if we want to print the data. Otherwise, we could just
---     pass pointers around, and the type system should be sufficient to ensure that
---     we're not messing things up.
-materializeShape :: IVar -> ImpM IVar
-materializeShape ~(_ :> IRefType (dims, _)) = do
-  let dimSizes = map (toScalarAtom IntTy . assumeUniform) dims
-  let idxTy = FixedIntRange 0 (length dimSizes)
-  (dest, ~[shapeVar]) <- allocDest Unmanaged $ TabTy idxTy IntTy
-  _ <- toImpTabCon idxTy dimSizes dest
-  return shapeVar
-  where
-    assumeUniform :: IDimType -> IExpr
-    assumeUniform (IUniform size) = size
-    assumeUniform (IPrecomputed _) = error "Precomputed sizes unsupported"
 
 runImpM :: ImpM a -> a
 runImpM m = fst $ runCat m mempty
@@ -94,7 +77,13 @@ impSubst env x = do
 
 toImpCExpr' :: PrimOp Type Atom (LamExpr, SubstEnv) -> ImpM Atom
 toImpCExpr' op = case op of
-  TabCon n _ rows -> alloc resultTy >>= toImpTabCon n rows
+  TabCon n _ rows -> do
+    dest <- alloc resultTy
+    forM_ (zip [0..] rows) $ \(i, row) -> do
+      i' <- intToIndex n $ IIntVal i
+      ithDest <- impTabGet dest i'
+      copyAtom ithDest row
+    return dest
   For d (LamExpr b@(_:>idxTy) body, env) -> do
     n' <-  indexSetSize idxTy
     dest <- alloc resultTy
@@ -168,14 +157,6 @@ toImpCExpr' op = case op of
     resultTy :: Type
     resultTy = getType $ CExpr $ fmapExpr op id id fst
 
-toImpTabCon :: Type -> [Atom] -> Atom -> ImpM Atom
-toImpTabCon n rows dest = do
-  forM_ (zip [0..] rows) $ \(i, row) -> do
-    i' <- intToIndex n $ IIntVal i
-    ithDest <- impTabGet dest i'
-    copyAtom ithDest row
-  return dest
-
 toScalarAtom :: Type -> IExpr -> Atom
 toScalarAtom _  (ILit v) = Con $ Lit v
 toScalarAtom ty x@(IVar (v:>_)) = case ty of
@@ -199,16 +180,18 @@ anyValue t = error $ "Expected a scalar type in anyValue, got: " ++ pprint t
 
 fromScalarAtom :: Atom -> ImpM IExpr
 fromScalarAtom atom = case atom of
-  Var (v:>ty)       -> return $ IVar (v :> typeToIType ty)
+  Var (v:>ty)       -> return $ IVar (v :> typeToIType ty [])
   Con (Lit x)       -> return $ ILit x
-  Con (AGet x)      -> load (fromArrayAtom x)
+  Con (AGet x)      -> load =<< fromArrayAtom x []
   Con (AsIdx _ x)   -> fromScalarAtom x
   Con (AnyValue ty) -> return $ anyValue ty
   _ -> error $ "Expected scalar, got: " ++ pprint atom
 
-fromArrayAtom :: Atom -> IExpr
-fromArrayAtom atom = case atom of
-  Var (v:>ty)          -> IVar (v :> typeToIType ty)
+fromArrayAtom :: Atom -> [IDimType] -> ImpM IExpr
+fromArrayAtom atom dims = case atom of
+  -- TODO: Assert dims match?
+  Var (v:>(IArrayTy dims' b)) -> return $ IVar $ v :> IRefType (dims', b)
+  Var v                       -> castArray v dims
   _ -> error $ "Expected array, got: " ++ pprint atom
 
 data AllocType = Managed | Unmanaged
@@ -228,21 +211,29 @@ allocDest allocTy ty = do
 makeDest :: Name -> Type -> ImpM (Atom, [IVar])
 makeDest name ty = runWriterT $ makeDest' name [] ty
 
+-- TODO: Handle more complicated index sets (possibly emit IPrecomputed instead of IUniform)
+extendDims :: Type -> [IDimType] -> ImpM [IDimType]
+extendDims t dims = case t of
+  (TC (IntRange _ _))     -> uniform
+  (TC (IndexRange _ _ _)) -> case dims of
+    [] -> uniform
+    _  -> error $ "IndexRanges only supported in the outermost array dimension"
+  (RecTy rec) -> do
+    newDims <- traverse (flip extendDims dims) $ toList rec
+    appendUniform <$> (impProd $ fmap (\(IUniform sz:_) -> sz) newDims)
+  (SumTy l r) -> do
+    ~(IUniform l':_) <- extendDims l dims
+    ~(IUniform r':_) <- extendDims r dims
+    appendUniform <$> impAdd l' r'
+  _           -> error "Missing a case for an index set type"
+  where
+    appendUniform sz = dims ++ [IUniform sz]
+    uniform = appendUniform <$> indexSetSize t
+
 makeDest' :: Name -> [IDimType] -> Type -> WriterT [IVar] ImpM Atom
 makeDest' name dims (TabTy n b) = do
-  -- TODO: Handle more complicated index sets (possibly emit IPrecomputed instead of IUniform)
-  assertSupported n
-  n' <- lift $ IUniform <$> indexSetSize n
-  liftM (Con . AFor n) $ makeDest' name (dims ++ [n']) b
-  where
-    assertSupported (TC (IntRange _ _))     = return ()
-    assertSupported (TC (IndexRange _ _ _)) = case dims of
-      [] -> return ()
-      _  -> error $ "IndexRanges only supported in the outermost array dimension"
-    assertSupported (RecTy rec) = traverse_ assertSupported rec
-    assertSupported (SumTy l r) = assertSupported l >> assertSupported r
-    assertSupported _           = error "Missing a case for an index set type"
-  -- TODO: This check is not perfect, because it doesn't traverse e.g. records
+  newDims <- lift $ n `extendDims` dims
+  liftM (Con . AFor n) $ makeDest' name newDims b
 makeDest' name dims ty@(TC con) = case con of
   BaseType b  -> do
     v <- lift $ freshVar (name :> IRefType (dims, b))
@@ -257,11 +248,15 @@ makeDest' name dims ty@(TC con) = case con of
 makeDest' _ _ ty = error $ "Can't lower type to imp: " ++ pprint ty
 
 impTabGet :: Atom -> Atom -> ImpM Atom
-impTabGet ~(Con (AFor it body)) i = do
+impTabGet a@(Con (AFor it _)) i = do
   i' <- indexToInt it i
-  flip traverseLeaves body $ \(~(Con (AGet arr))) -> do
-    ans <- emitInstr $ IGet (fromArrayAtom arr) i'
+  -- XXX: We traverse the full atom to include the it in dims
+  ~(Con (AFor _ b)) <- flip traverseLeaves a $ \(~(Con (AGet arr))) dims -> do
+    arr' <- (fromArrayAtom arr dims)
+    ans <- emitInstr $ IGet arr' i'
     return $ Con $ AGet $ impExprToAtom ans
+  return b
+impTabGet _ _ = error "Expected an array atom in impTabGet"
 
 intToIndex :: Type -> IExpr -> ImpM Atom
 intToIndex ty@(TC con) i = case con of
@@ -335,15 +330,13 @@ impTypeToType :: IType -> Type
 impTypeToType (IValType b)     = BaseTy b
 impTypeToType (IRefType arrTy) = TC $ IArrayType arrTy
 
-typeToIType :: Type -> IType
-typeToIType ty = case ty of
+-- TODO: Check that dims match?
+typeToIType :: Type -> [IDimType] -> IType
+typeToIType ty dims = case ty of
   BaseTy   b                 -> IValType b
   (TC (IArrayType arrTy))    -> IRefType arrTy
-  (TC (ArrayType (dims, b))) -> IRefType (map toIDimType dims, b)
+  (TC (ArrayType b))         -> IRefType (dims, b)
   _ -> error $ "Not a valid Imp type: " ++ pprint ty
-  where
-    toIDimType (Uniform size)  = IUniform $ IIntVal size
-    toIDimType (Precomputed _) = error "Not implemented yet"
 
 toImpBaseType :: Type -> BaseType
 toImpBaseType (TabTy _ a) = toImpBaseType a
@@ -374,54 +367,59 @@ indexSetSize (TC con) = case con of
     sizes <- traverse indexSetSize r
     impProd $ toList sizes
   BaseType BoolType -> return $ IIntVal 2
-  SumType (l, r) -> do
-    ls <- indexSetSize l
-    rs <- indexSetSize r
-    impAdd ls rs
+  SumType (l, r) -> bindM2 impAdd (indexSetSize l) (indexSetSize r)
   _ -> error $ "Not implemented " ++ pprint con
 indexSetSize ty = error $ "Not implemented " ++ pprint ty
 
-traverseLeaves :: Applicative f => (Atom -> f Atom) -> Atom -> f Atom
-traverseLeaves f atom = case atom of
-  Var _        -> f atom
-  Con (Lit  _) -> f atom
-  Con (AGet _) -> f atom
-  Con destCon -> liftA Con $ case destCon of
-    AsIdx n idx -> liftA (AsIdx n) $ recur idx
-    AFor n body -> liftA (AFor  n) $ recur body
-    RecCon r    -> liftA RecCon    $ traverse recur r
+traverseLeaves :: (Atom -> [IDimType] -> ImpM Atom) -> Atom -> ImpM Atom
+traverseLeaves f x = runIdentityT $ traverseLeavesM (\a d -> lift $ f a d) x
+
+traverseLeavesM :: (Monad (m ImpM), MonadTrans m) => (Atom -> [IDimType] -> m ImpM Atom) -> Atom -> m ImpM Atom
+traverseLeavesM = traverseLeaves' []
+
+traverseLeaves' :: (Monad (m ImpM), MonadTrans m) => [IDimType] -> (Atom -> [IDimType] -> m ImpM Atom) -> Atom -> m ImpM Atom
+traverseLeaves' dims f atom = case atom of
+  Var _        -> f atom dims
+  Con (Lit  _) -> f atom dims
+  Con (AGet _) -> f atom dims
+  Con destCon -> Con <$> case destCon of
+    AFor n body -> do
+      newDims <- lift $ (n `extendDims` dims)
+      liftM (AFor n) $ traverseLeaves' newDims f body
+    AsIdx n idx -> (AsIdx n) <$> recur idx
+    RecCon r    -> RecCon    <$> traverse recur r
     _ -> error $ "Not a valid Imp atom: " ++ pprint atom
   _ ->   error $ "Not a valid Imp atom: " ++ pprint atom
-  where recur = traverseLeaves f
+  where recur = traverseLeaves' dims f
 
-leavesList :: Atom -> [Atom]
-leavesList atom = execWriter $ flip traverseLeaves atom $ \leaf ->
-  tell [leaf] >> return leaf
+
+leavesList :: Atom -> ImpM [(Atom, [IDimType])]
+leavesList atom = execWriterT $ flip traverseLeavesM atom $ \leaf dims ->
+  tell [(leaf, dims)] >> return leaf
 
 copyAtom :: Atom -> Atom -> ImpM ()
-copyAtom dest src = zipWithM_ copyLeaf (leavesList dest) (leavesList src)
+copyAtom dest src = bindM2 (zipWithM_ copyLeaf) (leavesList dest) (leavesList src)
 
-copyLeaf :: Atom -> Atom -> ImpM ()
-copyLeaf ~(Con (AGet dest)) src = case src of
-  Con (AGet src') -> copy dest' (fromArrayAtom src')
-  _ -> do src' <- fromScalarAtom src
-          store dest' src'
-  where dest' = fromArrayAtom dest
+-- TODO: Assert dims are equal?
+copyLeaf :: (Atom, [IDimType]) -> (Atom, [IDimType]) -> ImpM ()
+copyLeaf (~(Con (AGet dest)), destDims) (src, srcDims) = case src of
+  Con (AGet src') -> bindM2 copy dest' (fromArrayAtom src' srcDims)
+  _ -> bindM2 store dest' (fromScalarAtom src)
+  where dest' = fromArrayAtom dest destDims
 
 initializeAtomZero :: Atom -> ImpM ()
-initializeAtomZero x = void $ flip traverseLeaves x $ \(~leaf@((Con (AGet dest)))) ->
-  initializeZero (fromArrayAtom dest) >> return leaf
+initializeAtomZero x = void $ flip traverseLeaves x $ \(~leaf@((Con (AGet dest)))) dims ->
+  fromArrayAtom dest dims >>= initializeZero >> return leaf
 
 addToAtom :: Atom -> Atom -> ImpM ()
-addToAtom dest src = zipWithM_ addToAtomLeaf (leavesList dest) (leavesList src)
+addToAtom dest src = bindM2 (zipWithM_ addToAtomLeaf) (leavesList dest) (leavesList src)
 
-addToAtomLeaf :: Atom -> Atom -> ImpM ()
-addToAtomLeaf ~(Con (AGet dest)) src = case src of
-  Con (AGet src') -> addToDestFromRef dest' (fromArrayAtom src')
-  _ -> do
-    src' <- fromScalarAtom src
-    addToDestScalar dest' src'
-  where dest' = fromArrayAtom dest
+addToAtomLeaf :: (Atom, [IDimType]) -> (Atom, [IDimType]) -> ImpM ()
+addToAtomLeaf (~(Con (AGet dest)), destDims) (src, srcDims) = case src of
+  Con (AGet src') -> bindM2 addToDestFromRef dest' (fromArrayAtom src' srcDims)
+  -- TODO: fromScalarAtom? Assert srcDims is empty?
+  _ -> bindM2 addToDestScalar dest' (fromScalarAtom src)
+  where dest' = fromArrayAtom dest destDims
 
 impProd :: [IExpr] -> ImpM IExpr
 impProd []     = return $ IOne
@@ -474,6 +472,10 @@ copy dest src = emitStatement (Nothing, Copy dest src)
 
 load :: IExpr -> ImpM IExpr
 load x = emitInstr $ Load x
+
+castArray :: Var -> [IDimType] -> ImpM IExpr
+castArray v@(_:>(ArrayTy b)) dims = emitInstr $ CastArray v (dims, b)
+castArray _ _ = error "Expected an array in castArray"
 
 store :: IExpr -> IExpr -> ImpM ()
 store dest src = emitStatement (Nothing, Store dest src)
@@ -551,10 +553,10 @@ dimSize dimTy = case dimTy of
 type ImpCheckM a = StateT Scope (ReaderT (Env IType) (Either Err)) a
 
 instance Checkable ImpFunction where
-   checkValid (ImpFunction _ _ vsIn (ImpProg prog)) = do
-     let env = foldMap varAsEnv vsIn
-     let scope = fmap (const ()) env
-     void $ runReaderT (runStateT (checkProg prog) scope) env
+  -- TODO: Keep array env around
+  checkValid (ImpFunction _ vsIn (ImpProg prog)) = do
+    let scope = foldMap (varAsEnv . fmap (const ())) vsIn
+    void $ runReaderT (runStateT (checkProg prog) scope) mempty
 
 checkProg :: [ImpStatement] -> ImpCheckM ()
 checkProg [] = return ()
@@ -574,7 +576,7 @@ instrTypeChecked :: ImpInstr -> ImpCheckM (Maybe IType)
 instrTypeChecked instr = case instr of
   IPrimOp op -> liftM Just $ checkImpOp op
   Load ref -> do
-    b <- (checkIExpr >=>  fromScalarRefType) ref
+    b <- (checkIExpr >=> fromScalarRefType) ref
     return $ Just $ IValType b
   Store dest val -> do
     b <- (checkIExpr >=> fromScalarRefType) dest
@@ -587,6 +589,13 @@ instrTypeChecked instr = case instr of
     -- FIXME: Reenable this check!
     --assertEq sourceTy destTy "Type mismatch in copy"
     return Nothing
+  CastArray v (dims, b) -> case v of
+    _ :> ArrayTy b' -> do
+      env <- get
+      when (not $ v `isin` env) $ throw CompilerErr $ "Unbound array variable: " ++ pprint v
+      assertEq b b' "Type mismatch in cast array"
+      return $ Just $ IRefType (dims, b)
+    _ -> throw CompilerErr $ "Casting a non-array variable to array"
   Alloc ty -> return $ Just $ IRefType ty
   Free _   -> return Nothing  -- TODO: check matched alloc/free
   Loop _ i size (ImpProg block) -> do
@@ -606,7 +615,7 @@ checkBinder v = do
   modify (<>(v@>()))
 
 checkValidType :: IType -> ImpCheckM ()
-checkValidType (IValType _         ) = return ()
+checkValidType (IValType _        ) = return ()
 checkValidType (IRefType (dims, _)) = mapM_ checkDimType dims
 
 checkDimType :: IDimType -> ImpCheckM ()
@@ -671,6 +680,7 @@ instrType instr = case instr of
   Load ref        -> liftM (Just . IValType) $ fromScalarRefType (impExprType ref)
   Store _ _       -> return Nothing
   Copy  _ _       -> return Nothing
+  CastArray _ ty  -> return $ Just $ IRefType ty
   Alloc ty        -> return $ Just $ IRefType ty
   Free _          -> return Nothing
   Loop _ _ _ _    -> return Nothing

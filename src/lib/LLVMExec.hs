@@ -23,14 +23,11 @@ import Foreign.Ptr
 import Foreign.Storable
 import Control.Exception
 import Control.Monad
-import Foreign.ForeignPtr
-import qualified Data.Vector.Storable as VS
 import Data.ByteString.Char8 (unpack)
 import Data.Maybe (fromMaybe)
 
 import Logging
 import Syntax
-import Array
 
 -- This forces the linker to link libdex.so. TODO: something better
 foreign import ccall "threefry2x32"  linking_hack :: Int -> Int -> Int
@@ -38,29 +35,20 @@ foreign import ccall "threefry2x32"  linking_hack :: Int -> Int -> Int
 foreign import ccall "dynamic"
   callFunPtr :: FunPtr (Ptr () -> IO ()) -> Ptr () -> IO ()
 
--- First element holds the number of dimensions and base type of each output array
-data LLVMFunction = LLVMFunction [(Int, BaseType)] L.Module
+-- First element holds the number of outputs
+data LLVMFunction = LLVMFunction Int L.Module
 
-callLLVM :: Logger [Output] -> LLVMFunction -> [ArrayRef] -> IO [ArrayRef]
-callLLVM logger (LLVMFunction outputTys ast) inArrays = do
-  argsPtr <- mallocBytes $ numIO * ptrSize
-  -- NB: Outputs come first!
-  forM_ (zip [numOutputs..] inArrays) $ \(i, ArrayRef _ p) -> do
+callLLVM :: Logger [Output] -> LLVMFunction -> [Ptr ()] -> IO [Ptr ()]
+callLLVM logger (LLVMFunction numOutputs ast) inArrays = do
+  argsPtr <- mallocBytes $ (numOutputs + numInputs) * ptrSize
+  forM_ (zip [numOutputs..] inArrays) $ \(i, p) -> do
     poke (argsPtr `plusPtr` (i * ptrSize)) p
   evalLLVM logger ast argsPtr
-  outputPtrs <- forM [0..numOutputArrays - 1] $ \i -> peek (argsPtr `plusPtr` (i * ptrSize))
-  outputTypes <- forM (zip [numOutputArrays..numOutputs - 1] outputTys) $ \(i, (ndim, b)) -> do
-    -- TODO: Free the shape!
-    shapePtr <- newForeignPtr_ =<< peek (argsPtr `plusPtr` (i * ptrSize))
-    let shape = VS.unsafeFromForeignPtr0 shapePtr ndim
-    return $ (fmap Uniform $ VS.toList shape, b)
+  outputPtrs <- forM [0..numOutputs - 1] $ \i -> peek (argsPtr `plusPtr` (i * ptrSize))
   free argsPtr
-  return $ zipWith ArrayRef outputTypes outputPtrs
+  return outputPtrs
   where
     numInputs = length inArrays
-    numOutputArrays = length outputTys
-    numOutputs = numOutputArrays * 2
-    numIO = numOutputs + numInputs
     ptrSize = 8 -- TODO: Get this from LLVM instead of hardcoding!
 
 evalLLVM :: Logger [Output] -> L.Module -> Ptr () -> IO ()

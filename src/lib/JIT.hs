@@ -31,7 +31,6 @@ import Data.String
 import Data.Text.Prettyprint.Doc
 import GHC.Stack
 
-import Array hiding (elemCount)
 import LLVMExec
 import Syntax
 import Env
@@ -65,11 +64,10 @@ runCompileM env m = evalState (runReaderT m env) initState
   where initState = CompileState [] [] [] "start_block" mempty mempty []
 
 compileTopProg :: ImpFunction -> CompileM LLVMFunction
-compileTopProg (ImpFunction outVarsArr outVarsShape inVars (ImpProg prog)) = do
+compileTopProg (ImpFunction outVars inVars (ImpProg prog)) = do
   -- Set up the argument list. Note that all outputs are pointers to pointers.
-  let outVars = outVarsArr ++ outVarsShape
-  let inVarTypes  = map (impRefAsPtr . varAnn) inVars
-  let outVarTypes = map (L.ptr . impRefAsPtr . varAnn) outVars
+  let inVarTypes  = map (        L.ptr . scalarTy . varAnn) inVars
+  let outVarTypes = map (L.ptr . L.ptr . scalarTy . varAnn) outVars
   (inParams, inOperands)   <- unzip <$> mapM freshParamOpPair inVarTypes
   (outParams, outOperands) <- unzip <$> mapM freshParamOpPair outVarTypes
 
@@ -83,10 +81,9 @@ compileTopProg (ImpFunction outVarsArr outVarsShape inVars (ImpProg prog)) = do
   specs <- gets funSpecs
   decls <- gets scalarDecls
   blocks <- gets (reverse . curBlocks)
-  return $ LLVMFunction outArrTys $ makeModule (outParams ++ inParams) decls blocks specs
+  return $ LLVMFunction numOutputs $ makeModule (outParams ++ inParams) decls blocks specs
   where
-    outArrTys = fmap (\(_ :> IRefType (dims, b)) -> (length dims, b)) outVarsArr
-    impRefAsPtr ~(IRefType (_, b)) = L.ptr $ scalarTy b
+    numOutputs = length outVars
 
 freshParamOpPair :: L.Type -> CompileM (Parameter, Operand)
 freshParamOpPair ty = do
@@ -139,6 +136,7 @@ compileInstr allowAlloca instr = case instr of
         numBytes <- mul (litInt 8) =<< elemCount dims
         copy numBytes dest' source'
     return Nothing
+  CastArray src _ -> Just <$> asks (! src)
   Alloc (dims, ty) -> Just <$> case dims of
     [] | allowAlloca -> alloca ty
     _  -> do
