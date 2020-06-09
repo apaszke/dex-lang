@@ -34,6 +34,26 @@ import Util (bindM2)
 type EmbedEnv = ([IVar], (Scope, ImpProg))
 type ImpM = Cat EmbedEnv
 
+type ScalarVar = VarP BaseType
+type RefVar    = VarP IArrayType
+
+data IAtom = IAVar ScalarVar
+           | IALit LitVal
+           | IADest IDest
+
+-- Atoms that can be used as a destination for writes
+data IDest = IDVar RefVar
+           | IDSumCon IAtom IAtom IAtom
+           | IDRecCon IAtom IAtom IAtom
+           | IDTabCon IAtom
+
+data IAtomType = IAScalarType BaseType
+               | IADestType IDestType
+
+data IDestType = IDType IArrayType
+               | IDRecType (Record IDestType)
+               | IDSumType IDestType IDestType IDestType
+
 toImpFunction :: ([Var], Expr) -> ImpFunction
 toImpFunction (vsIn, expr) = runImpM $ do
   (vsOut, prog) <- scopedBlock $ materializeResult
@@ -50,7 +70,8 @@ toImpFunction (vsIn, expr) = runImpM $ do
 runImpM :: ImpM a -> a
 runImpM m = fst $ runCat m mempty
 
-toImpExpr :: SubstEnv -> Expr -> ImpM Atom
+-- TODO: Make the env map Vars to IAtoms, types seem to be unnecessary!
+toImpExpr :: SubstEnv -> Expr -> ImpM IAtom
 toImpExpr env expr = case expr of
   Decl (Let b bound) body -> do
     b' <- traverse (impSubst env) b
