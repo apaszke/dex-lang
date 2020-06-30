@@ -218,7 +218,6 @@ instance CoreVariant (PrimCon a) where
     ClassDictHole _ -> goneBy Core
     NewtypeCon _ _  -> goneBy Simp
     SumCon _ _ _    -> alwaysAllowed -- not sure what this should be
-    RefCon _ _      -> neverAllowed
     Todo _          -> goneBy Simp
     _ -> alwaysAllowed
 
@@ -332,7 +331,6 @@ typeCheckCon con = case con of
   SumCon _ l r -> SumTy <$> typeCheck l <*> typeCheck r
   PairCon x y -> PairTy <$> typeCheck x <*> typeCheck y
   UnitCon -> return UnitTy
-  RefCon r x -> r|:TyKind >> RefTy r <$> typeCheck x
   AsIdx n e -> n|:TyKind >> e|:IntTy $> n
   NewtypeCon toTy x -> toTy|:TyKind >> typeCheck x $> toTy
   ClassDictHole ty -> ty |: TyKind >> return ty

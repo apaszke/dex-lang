@@ -132,7 +132,6 @@ instance Pretty e => Pretty (PrimCon e) where
     ArrayLit _ array -> p array
     PairCon x y -> parens $ p x <+> "," <+> p y
     UnitCon     -> "()"
-    RefCon _ _  -> "RefCon"
     AsIdx n i   -> p i <> "@" <> parens (p n)
     AnyValue t  -> parens $ "AnyValue @" <> p t
     SumCon c l r -> parens $ case pprint c of

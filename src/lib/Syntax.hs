@@ -206,7 +206,6 @@ data PrimCon e =
       | SumCon e e e      -- (bool constructor tag (True is Left), left value, right value)
       | PairCon e e
       | UnitCon
-      | RefCon e e
       | AsIdx e e         -- Construct an index from its ordinal index (zero-based int)
       | NewtypeCon e e    -- result type, argument
       | ClassDictHole e   -- Only used during type inference
