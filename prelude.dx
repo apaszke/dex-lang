@@ -507,10 +507,6 @@ def logsumexp (x: n=>Float) : Float =
   m = maximum x
   m + (log $ sum for i. exp (x.i - m))
 
-def logsoftmax (x: n=>Float) : n=>Float =
-  lse = logsumexp x
-  for i. x.i - lse
-
 def softmax (x: n=>Float) : n=>Float =
   m = maximum x
   e =  for i. exp (x.i - m)

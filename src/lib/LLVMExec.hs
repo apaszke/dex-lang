@@ -32,6 +32,7 @@ import LLVM.Context
 import Data.Time.Clock (getCurrentTime, diffUTCTime)
 import System.IO.Unsafe
 import System.Directory (listDirectory)
+import System.IO
 
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
@@ -62,7 +63,7 @@ compilePTX logger (LLVMKernel ast) = do
         linkLibdevice ctx        m
         linkDexrt     ctx        m
         internalize   ["kernel"] m
-        compileModule logger tm  m
+        --compileModule logger tm  m
         PTXKernel . unpack <$> Mod.moduleTargetAssembly tm m
 
 callLLVM :: Logger [Output] -> LLVMFunction -> [Ptr ()] -> IO [Ptr ()]
@@ -83,6 +84,7 @@ callLLVM logger (LLVMFunction numOutputs ast) inArrays = do
 
 evalLLVM :: Logger [Output] -> L.Module -> Ptr () -> IO ExitCode
 evalLLVM logger ast argPtr = do
+  T.initializeAllTargets
   resolvers <- newIORef M.empty
   withContext $ \c -> do
     void $ Linking.loadLibraryPermanently Nothing
@@ -95,10 +97,10 @@ evalLLVM logger ast argPtr = do
       --      hurt performance if we were to end up doing a lot of function calls.
       -- TODO: Consider changing the linking layer, as suggested in:
       --       http://llvm.1065342.n5.nabble.com/llvm-dev-ORC-JIT-Weekly-5-td135203.html
-      T.withHostTargetMachine R.PIC CM.Large CGO.Aggressive $ \tm -> do
+      T.withHostTargetMachine R.PIC CM.Small CGO.Default $ \tm -> do
         linkDexrt     c            m
         internalize   ["entryFun"] m
-        compileModule logger tm    m
+        compileModule logger c tm  m
         JIT.withExecutionSession $ \exe ->
           JIT.withObjectLinkingLayer exe (\k -> (M.! k) <$> readIORef resolvers) $ \linkLayer ->
             JIT.withIRCompileLayer linkLayer tm $ \compileLayer -> do
@@ -132,13 +134,24 @@ evalLLVM logger ast argPtr = do
                     , JIT.jitSymbolFlags = JIT.defaultJITSymbolFlags { JIT.jitSymbolExported = True, JIT.jitSymbolAbsolute = True }
                     }
 
-compileModule :: Logger [Output] -> T.TargetMachine -> Mod.Module -> IO ()
-compileModule logger tm m = do
+compileModule :: Logger [Output] -> Context -> T.TargetMachine -> Mod.Module -> IO ()
+compileModule logger ctx tm m = do
   showModule          m >>= logPass logger JitPass
   L.verify            m
   runDefaultPasses tm m
   showModule          m >>= logPass logger LLVMOpt
+  Mod.moduleBitcode m
+  --Mod.withModuleFromLLVMAssembly ctx ll $ \m -> return ()
   showAsm          tm m >>= logPass logger AsmPass
+  --withFile "v1.ll" WriteMode $ \h -> showModule m >>= hPutStr h
+  --showAsm          tm m >>= logPass logger AsmPass
+  --withFile "v2.ll" WriteMode $ \h -> showModule m >>= hPutStr h
+  --showAsm          tm m >>= logPass logger AsmPass
+  --withFile "v3.ll" WriteMode $ \h -> showModule m >>= hPutStr h
+  --showAsm          tm m >>= logPass logger AsmPass
+  --withFile "v4.ll" WriteMode $ \h -> showModule m >>= hPutStr h
+  --showAsm          tm m >>= logPass logger AsmPass
+  --withFile "v5.ll" WriteMode $ \h -> showModule m >>= hPutStr h
 
 logPass :: Logger [Output] -> PassName -> String -> IO ()
 logPass logger passName s = logThis logger [PassInfo passName s]
@@ -171,7 +184,7 @@ runPasses passes mt m = do
 showAsm :: T.TargetMachine -> Mod.Module -> IO String
 showAsm t m = do
   -- Uncomment this to dump assembly to a file that can be linked to a C benchmark suite:
-  -- Mod.writeObjectToFile t (Mod.File "asm.o") m
+  --Mod.writeObjectToFile t (Mod.File "asm.o") m
   liftM unpack $ Mod.moduleTargetAssembly t m
 
 internalize :: [String] -> Mod.Module -> IO ()
@@ -192,7 +205,7 @@ withGPUTargetMachine computeCapability next = do
       topt
       R.Default
       CM.Default
-      CGO.Aggressive
+      CGO.Default
       next
 
 -- === dex runtime ===
@@ -210,7 +223,7 @@ dexrtAST = unsafePerformIO $ do
     stripFunctionAnnotations ast =
       ast { L.moduleDefinitions = stripDef <$> L.moduleDefinitions ast }
     stripDef def@(L.GlobalDefinition f@L.Function{..}) = case basicBlocks of
-      [] -> def
+      _ | name == "aligned_alloc_noinline" -> L.GlobalDefinition $ f { L.functionAttributes = [Right FA.NoInline] }
       _  -> L.GlobalDefinition $ f { L.functionAttributes = [] }
     stripDef def = def
 

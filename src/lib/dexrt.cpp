@@ -17,15 +17,26 @@
 
 extern "C" {
 
-void* malloc_dex(int64_t nbytes) {
-  // XXX: Changes to this value might require additional changes to parameter attributes in LLVM
+void aligned_alloc_noinline(void **addr, int64_t nbytes) {
   static const int64_t alignment = 64;
+
   // Round nbytes up to the nearest multiple of alignment, as required by the C11 standard.
   nbytes = ((nbytes + alignment - 1) / alignment) * alignment;
-  //return aligned_alloc(alignment, nbytes);
-  void *ptr = nullptr;
-  posix_memalign(&ptr, alignment, nbytes);
-  printf("Allocated %p\n", ptr);
+  *addr = aligned_alloc(alignment, nbytes);
+}
+
+char* malloc_dex(int64_t nbytes) {
+  // XXX: Changes to this value might require additional changes to parameter attributes in LLVM
+  static const int64_t alignment = 64;
+
+  // Round nbytes up to the nearest multiple of alignment, as required by the C11 standard.
+  //nbytes = ((nbytes + alignment - 1) / alignment) * alignment;
+  //void *ptr = aligned_alloc(alignment, nbytes);
+
+  char *ptr = nullptr;
+  if (posix_memalign((void**)&ptr, alignment, nbytes)) {}
+  //aligned_alloc_noinline(&ptr, nbytes);
+
   return ptr;
 }
 
