@@ -264,6 +264,7 @@ linearizeHof env hof = case hof of
   While _ _   -> notImplemented
   Linearize _ -> error "Unexpected linearization"
   Transpose _ -> error "Unexpected transposition"
+  PTileReduce _ _ -> error "Unexpected PTileReduce"
   where
     linearizeEff maybeInit lam hasResult hofMaker emitter eff = LinA $ do
       (valHofMaker, maybeLinInit) <- case maybeInit of
@@ -670,6 +671,7 @@ transposeHof hof ct = case hof of
   While    _ _ -> notImplemented
   Linearize  _ -> error "Unexpected linearization"
   Transpose  _ -> error "Unexpected transposition"
+  PTileReduce _ _ -> error "Unexpected PTileReduce"
 
 transposeAtom :: Atom -> Atom -> TransposeM ()
 transposeAtom atom ct = case atom of

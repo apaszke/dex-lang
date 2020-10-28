@@ -263,6 +263,7 @@ exprEffs expr = case expr of
     RunReader _ f   -> handleRunner Reader f
     RunWriter   f   -> handleRunner Writer f
     RunState  _ f   -> handleRunner State  f
+    PTileReduce _ _ -> mempty  -- Arguments have to be pure functions
   Case _ alts _ -> foldMap (\(Abs _ block) -> blockEffs block) alts
   where
     handleRunner effName ~(BinaryFunVal (Bind (h:>_)) _ (EffectRow effs Nothing) _) =
@@ -430,6 +431,7 @@ instance CoreVariant (PrimHof a) where
     Linearize _   -> goneBy Simp
     Transpose _   -> goneBy Simp
     Tile _ _ _    -> alwaysAllowed
+    PTileReduce _ _ -> absentUntil Simp  -- really absent until parallelization
 
 -- TODO: namespace restrictions?
 alwaysAllowed :: VariantM ()
@@ -561,6 +563,7 @@ typeCheckTyCon tc = case tc of
   TypeKind         -> return TyKind
   EffectRowKind    -> return TyKind
   LabeledRowKindTC -> return TyKind
+  ParIndexRange _ tid nthr t -> tid|:IdxRepTy >> nthr|:IdxRepTy >> t|:TyKind >> return TyKind
 
 typeCheckCon :: Con -> TypeM Type
 typeCheckCon con = case con of
@@ -595,6 +598,7 @@ typeCheckCon con = case con of
       tag |:(RawRefTy TagRepTy)
       return $ RawRefTy ty
     _ -> error $ "Not a valid ref: " ++ pprint conRef
+  ParIndexCon t v -> t|:TyKind >> v|:IdxRepTy >> return t
   RecordRef _ -> error "Not implemented"
 
 typeCheckRef :: HasType a => a -> TypeM Type
@@ -670,8 +674,10 @@ typeCheckOp op = case op of
                                     "fixed-width base types, but got: " ++ pprint argTy
     return ansTy
   Inject i -> do
-    TC (IndexRange ty _ _) <- typeCheck i
-    return ty
+    TC tc <- typeCheck i
+    case tc of
+      IndexRange ty _ _ -> return ty
+      ParIndexRange _ _ _ ty -> return ty
   PrimEffect ref m -> do
     TC (RefType h s) <- typeCheck ref
     let h'' = case h of
@@ -802,6 +808,14 @@ typeCheckHof hof = case hof of
       replaceDim 0 (TabTy _ b) n  = TabTy (Ignore n) b
       replaceDim d (TabTy dv b) n = TabTy dv $ replaceDim (d-1) b n
       replaceDim _ _ _ = error "This should be checked before"
+  PTileReduce n mapping -> do
+    -- mapping : threadElems:Type -> (threadElems=>a, r)
+    FunTy (Bind threadElems) Pure mapResultTy <- typeCheck mapping
+    PairTy tiledArrTy accTy <- return mapResultTy
+    TabTy (Bind threadElems') tileElemTy <- return tiledArrTy
+    checkEq threadElems threadElems'
+    -- PTileReduce n mapping reduction : (n=>a, ro)
+    return $ PairTy (TabTy (Ignore n) tileElemTy) accTy
   While cond body -> do
     Pi (Abs (Ignore UnitTy) (arr , condTy)) <- typeCheck cond
     Pi (Abs (Ignore UnitTy) (arr', bodyTy)) <- typeCheck body

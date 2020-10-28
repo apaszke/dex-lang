@@ -468,6 +468,7 @@ simplifyHof hof = case hof of
     (ans, sOut) <- fromPair =<< (emit $ Hof $ RunState s' lam')
     ans' <- applyRecon recon ans
     return $ PairVal ans' sOut
+  PTileReduce _ _ -> error "Unexpected PTileReduce"
   where
     applyRecon Nothing x = return x
     applyRecon (Just f) x = f x

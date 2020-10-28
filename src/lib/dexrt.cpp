@@ -139,18 +139,15 @@ double randunif(uint64_t keypair) {
 }
 
 void dex_parallel_for(char *function_ptr, int64_t size, char **args) {
-  auto function = reinterpret_cast<void (*)(int64_t, int64_t, int64_t, char**)>(function_ptr);
+  auto function = reinterpret_cast<void (*)(int64_t, char**)>(function_ptr);
   int64_t nthreads = std::thread::hardware_concurrency();
   if (size < nthreads) {
     nthreads = size;
   }
   std::vector<std::thread> threads(nthreads);
-  int64_t chunk_size = size / nthreads;
   for (int64_t t = 0; t < nthreads; ++t) {
-    int64_t start = t * chunk_size;
-    int64_t end = t == nthreads - 1 ? size : (t + 1) * chunk_size;
-    threads[t] = std::thread([function, args, t, start, end]() {
-      function(t, start, end, args);
+    threads[t] = std::thread([function, args, t]() {
+      function(t, args);
     });
   }
   for (auto& thread : threads) {
@@ -205,14 +202,27 @@ void dex_cuMemcpyHtoD(int64_t bytes, char* device_ptr, char* host_ptr) {
   CHECK(cuMemcpyHtoD, reinterpret_cast<CUdeviceptr>(device_ptr), host_ptr, bytes);
 }
 
+void dex_queryParallelismCUDA(const void* _, int64_t iters,
+                              int32_t* numWorkgroups, int32_t* workgroupSize) {
+  if (iters == 0) {
+    *numWorkgroups = 0;
+    *workgroupSize = 0;
+    return;
+  }
+  // TODO: Use the occupancy calculator, or at least use a fixed number of blocks?
+  const int32_t fixedWgSize = 32;
+  *workgroupSize = fixedWgSize;
+  *numWorkgroups = (iters + fixedWgSize - 1) / fixedWgSize;
+}
+
 void dex_cuLaunchKernel(const void* kernel_text, int64_t iters, char** args) {
   if (iters == 0) return;
   CUmodule module;
   CHECK(cuModuleLoadData, &module, kernel_text);
   CUfunction kernel;
   CHECK(cuModuleGetFunction, &kernel, module, "kernel");
-  const int64_t block_dim_x = 256;
-  const int64_t grid_dim_x = (iters + block_dim_x - 1) / block_dim_x;
+  int32_t block_dim_x, grid_dim_x;
+  dex_queryParallelismCUDA(nullptr, iters, &grid_dim_x, &block_dim_x);
   CHECK(cuLaunchKernel, kernel,
                         grid_dim_x, 1, 1,               // grid size
                         block_dim_x, 1, 1,              // block size

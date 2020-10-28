@@ -14,6 +14,8 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE Rank2Types #-}
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Imp (toImpModule, getIType, impBlockType, impFunType, impFunVar,
@@ -161,27 +163,6 @@ translateExpr env (maybeDest, expr) = case expr of
         destToAtom dest
       _ -> error $ "Unexpected scrutinee: " ++ pprint e'
 
-launchKernel :: SubstEnv -> WithDest Atom -> ImpM Atom
-launchKernel env (maybeDest, ~lbody@(LamVal b body)) = do
-  opts  <- ask
-  idxTy <- impSubst env $ binderType b
-  n     <- indexSetSize idxTy
-  dest  <- allocDest maybeDest $ getType $ Hof $ For ParallelFor lbody
-  i     <- freshVar $ binderNameHint b:>getIType n
-  tid   <- freshVar $ "tid":>getIType n
-  let (cc, dev) = case impBackend opts of
-        LLVMCUDA -> (CUDAKernelLaunch, GPU)
-        LLVMMC   -> (MCThreadLaunch  , CPU)
-        backend -> error $ "Shouldn't be launching kernels from " ++ show backend
-  kernelBody <- withDevice dev $ withLevel ThreadLevel $ scopedVoidBlock $ do
-    idx <- intToIndex idxTy $ IVar i
-    ithDest <- destGet dest idx
-    void $ translateBlock (env <> b @> idx) (Just ithDest, body)
-  let args = envAsVars $ freeIVars kernelBody `envDiff` (i @> ())
-  f <- emitFunction cc (map Bind (tid:i:args)) kernelBody
-  emitStatement $ ILaunch f n $ map IVar args
-  destToAtom dest
-
 emitFunction :: CallingConvention -> [IBinder] -> ImpBlock -> ImpM IFunVar
 emitFunction cc bs body = do
   funEnv <- looks envFunctions
@@ -238,15 +219,16 @@ toImpOp (maybeDest, op) = case op of
         Con (IntRangeVal   _ _   i) -> returnVal $ i
         Con (IndexRangeVal _ _ _ i) -> returnVal $ i
         _ -> returnVal . toScalarAtom =<< indexToInt idx
-  Inject e -> do
-    let (TC (IndexRange t low _)) = getType e
-    offset <- case low of
-      InclusiveLim a -> indexToInt a
-      ExclusiveLim a -> indexToInt a >>= iaddI (IIdxRepVal 1)
-      Unlimited      -> return (IIdxRepVal 0)
-    restrictIdx <- indexToInt e
-    idx <- iaddI restrictIdx offset
-    returnVal =<< intToIndex t idx
+  Inject e -> case e of
+    Con (IndexRangeVal t low _ restrictIdx) -> do
+      offset <- case low of
+        InclusiveLim a -> indexToInt a
+        ExclusiveLim a -> indexToInt a >>= iaddI (IIdxRepVal 1)
+        Unlimited      -> return (IIdxRepVal 0)
+      returnVal =<< intToIndex t =<< iaddI (fromScalarAtom restrictIdx) offset
+    Con (ParIndexCon (TC (ParIndexRange _ _ _ realIdxTy)) i) -> do
+      returnVal =<< intToIndex realIdxTy (fromScalarAtom i)
+    _ -> error $ "Unsupported argument to inject: " ++ pprint e
   IndexRef refDest i -> returnVal =<< destGet refDest i
   FstRef ~(Con (ConRef (PairCon ref _  ))) -> returnVal ref
   SndRef ~(Con (ConRef (PairCon _   ref))) -> returnVal ref
@@ -303,23 +285,52 @@ toImpHof :: SubstEnv -> WithDest Hof -> ImpM Atom
 toImpHof env (maybeDest, hof) = do
   resultTy <- impSubst env $ getType $ Hof hof
   case hof of
-    For ParallelFor body -> do
-      backend <- asks impBackend
-      level   <- asks curLevel
-      unless (  level == TopLevel
-             && backend `elem` [LLVMCUDA, LLVMMC]
-             && isPure (Hof hof)) $ error "Invalid kernel launch"
-      launchKernel env (maybeDest, body)
-    For (RegularFor d) (LamVal b body) -> do
+    For (RegularFor d) ~(LamVal b body) -> do
       idxTy <- impSubst env $ binderType b
-      n' <- indexSetSize idxTy
+      case idxTy of
+        TC (ParIndexRange dev tid numThreads realIdxTy) -> do
+          n    <- indexSetSize realIdxTy
+          dest <- allocDest maybeDest resultTy
+          case dev of
+            CPU -> do -- Chunked loop
+              undefined
+            GPU -> do -- Grid stride loop
+              iPtr <- alloc IdxRepTy
+              copyAtom iPtr tid
+              cond <- liftM snd $ scopedBlock $ do
+                i <- destToAtom iPtr
+                inRange <- (fromScalarAtom i) `iltI` n
+                return ((), [inRange])
+              wbody <- scopedVoidBlock $ do
+                i <- destToAtom iPtr
+                let idx = Con $ ParIndexCon idxTy i
+                ithDest <- destGet dest idx
+                void $ translateBlock (env <> b @> idx) (Just ithDest, body)
+                copyAtom iPtr . toScalarAtom =<< iaddI (fromScalarAtom i) (fromScalarAtom numThreads)
+              emitStatement $ IWhile cond wbody
+          destToAtom dest
+        _ -> do
+          n <- indexSetSize idxTy
+          dest <- allocDest maybeDest resultTy
+          emitLoop (binderNameHint b) d n $ \i -> do
+            idx <- intToIndex idxTy i
+            ithDest <- destGet dest idx
+            void $ translateBlock (env <> b @> idx) (Just ithDest, body)
+          destToAtom dest
+    For ParallelFor ~fbody@(LamVal b _) -> do
+      idxTy <- impSubst env $ binderType b
       dest <- allocDest maybeDest resultTy
-      emitLoop (binderNameHint b) d n' $ \i -> do
-        idx <- intToIndex idxTy i
-        ithDest <- destGet dest idx
-        void $ translateBlock (env <> b @> idx) (Just ithDest, body)
+      buildKernel idxTy $ \LaunchInfo{..} buildBody -> do
+        liftM (,()) $ buildBody $ \ThreadInfo{..} -> do
+          let threadBody = fst $ flip runSubstEmbed (freeVars fbody) $
+                buildLam (Bind $ "hwidx" :> threadRange) PureArrow $ \hwidx ->
+                  appReduce fbody =<< (emitOp $ Inject hwidx)
+          let threadDest = Con $ TabRef $ fst $ flip runSubstEmbed (freeVars dest) $
+                buildLam (Bind $ "hwidx" :> threadRange) TabArrow $ \hwidx ->
+                  indexDest dest =<< (emitOp $ Inject hwidx)
+          void $ toImpHof env (Just threadDest, For (RegularFor Fwd) threadBody)
       destToAtom dest
-    Tile d (LamVal tb tBody) (LamVal sb sBody) -> do
+    Tile d ~(LamVal tb tBody) ~(LamVal sb sBody) -> do
       ~(TC (IndexSlice idxTy tileIdxTy)) <- impSubst env $ binderType tb
       n <- indexSetSize idxTy
       dest <- allocDest maybeDest resultTy
@@ -338,29 +349,149 @@ toImpHof env (maybeDest, hof) = do
         sDest <- fromEmbed $ indexDestDim d dest idx
         void $ translateBlock (env <> sb @> idx) (Just sDest, sBody)
       destToAtom dest
-    While (Lam (Abs _ (_, cond))) (Lam (Abs _ (_, body))) -> do
+    While ~(Lam (Abs _ (_, cond))) ~(Lam (Abs _ (_, body))) -> do
       cond' <- liftM snd $ scopedBlock $ do
                  ans <- translateBlock env (Nothing, cond)
                  return ((), [fromScalarAtom ans])
       body' <- scopedVoidBlock $ void $ translateBlock env (Nothing, body)
       emitStatement $ IWhile cond' body'
       return UnitVal
-    RunReader r (BinaryFunVal _ ref _ body) -> do
+    RunReader r ~(BinaryFunVal _ ref _ body) -> do
       rDest <- alloc $ getType r
       copyAtom rDest =<< impSubst env r
       translateBlock (env <> ref @> rDest) (maybeDest, body)
-    RunWriter (BinaryFunVal _ ref _ body) -> do
+    RunWriter ~(BinaryFunVal _ ref _ body) -> do
       (aDest, wDest) <- destPairUnpack <$> allocDest maybeDest resultTy
       let RefTy _ wTy = getType ref
       copyAtom wDest (zeroAt wTy)
       void $ translateBlock (env <> ref @> wDest) (Just aDest, body)
       PairVal <$> destToAtom aDest <*> destToAtom wDest
-    RunState s (BinaryFunVal _ ref _ body) -> do
+    RunState s ~(BinaryFunVal _ ref _ body) -> do
       (aDest, sDest) <- destPairUnpack <$> allocDest maybeDest resultTy
       copyAtom sDest =<< impSubst env s
       void $ translateBlock (env <> ref @> sDest) (Just aDest, body)
       PairVal <$> destToAtom aDest <*> destToAtom sDest
-    _ -> error $ "Invalid higher order function primitive: " ++ pprint hof
+    PTileReduce idxTy' ~(LamVal threadRangeB body) -> do
+      idxTy <- impSubst env idxTy'
+      (mappingDest, finalAccDest) <- destPairUnpack <$> allocDest maybeDest resultTy
+      let PairTy _ accType = resultTy
+      (numTileWorkgroups, wgResArr, widIdxTy) <- buildKernel idxTy $ \LaunchInfo{..} buildBody -> do
+        let widIdxTy = Fin $ toScalarAtom numWorkgroups
+        let tidIdxTy = Fin $ toScalarAtom workgroupSize
+        wgResArr  <- alloc $ TabTy (Ignore widIdxTy) accType
+        thrAccArr <- alloc $ TabTy (Ignore widIdxTy) $ TabTy (Ignore tidIdxTy) accType
+        mappingKernelBody <- buildBody $ \ThreadInfo{..} -> do
+          let scope = freeVars mappingDest
+          let tileDest = Con $ TabRef $ fst $ flip runSubstEmbed scope $ do
+                buildLam (Bind $ "hwidx":>threadRange) TabArrow $ \hwidx -> do
+                  indexDest mappingDest =<< (emitOp $ Inject hwidx)
+          wgAccs <- destGet thrAccArr =<< intToIndex widIdxTy wid
+          thrAcc <- destGet wgAccs    =<< intToIndex tidIdxTy tid
+          let threadDest = Con $ ConRef $ PairCon tileDest thrAcc
+          void $ translateBlock (env <> threadRangeB @> threadRange) (Just threadDest, body)
+          wgRes <- destGet wgResArr =<< intToIndex widIdxTy wid
+          workgroupReduce tid wgRes wgAccs workgroupSize
+        return (mappingKernelBody, (numWorkgroups, wgResArr, widIdxTy))
+      -- TODO: Skip the reduction kernel if unnecessary?
+      -- TODO: Reduce sequentially in the CPU backend?
+      -- TODO: Actually we only need the previous-power-of-2 many threads
+      buildKernel widIdxTy $ \LaunchInfo{..} buildBody -> do
+        -- We only do a one-level reduciton in the workgroup, so it is correct
+        -- only if the end up scheduling a single workgroup.
+        moreThanOneGroup <- (IIdxRepVal 1) `iltI` numWorkgroups
+        guardBlock moreThanOneGroup $ emitStatement IThrowError
+        redKernelBody <- buildBody $ \ThreadInfo{..} ->
+          workgroupReduce tid finalAccDest wgResArr numTileWorkgroups
+        return (redKernelBody, ())
+      PairVal <$> destToAtom mappingDest <*> destToAtom finalAccDest
+      where
+        guardBlock cond m = do
+          block <- scopedVoidBlock m
+          emitStatement $ ICond cond block (ImpBlock mempty mempty)
+        workgroupReduce tid resDest arrDest elemCount = do
+          elemCountDown2 <- prevPowerOf2 elemCount
+          let RawRefTy (TabTy arrIdxB _) = getType arrDest
+          let arrIdxTy = binderType arrIdxB
+          offPtr <- alloc IdxRepTy
+          copyAtom offPtr $ toScalarAtom elemCountDown2
+          cond <- liftM snd $ scopedBlock $ do
+            off  <- fromScalarAtom <$> destToAtom offPtr
+            cond <- emitInstr $ IPrimOp $ ScalarBinOp (ICmp Greater) off (IIdxRepVal 0)
+            return ((), [cond])
+          wbody <- scopedVoidBlock $ do
+            off       <- fromScalarAtom <$> destToAtom offPtr
+            loadIdx   <- iaddI tid off
+            shouldAdd <- bindM2 bandI (tid `iltI` off) (loadIdx `iltI` elemCount)
+            guardBlock shouldAdd $ do
+              threadDest <- destGet arrDest =<< intToIndex arrIdxTy tid
+              addToAtom threadDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy loadIdx
+            emitStatement ISyncWorkgroup
+            copyAtom offPtr . toScalarAtom =<< off `idivI` (IIdxRepVal 2)
+          firstThread <- tid `iltI` (IIdxRepVal 1)
+          guardBlock firstThread $
+            copyAtom resDest =<< destToAtom =<< destGet arrDest =<< intToIndex arrIdxTy tid
+          emitStatement $ IWhile cond wbody
+        -- TODO: Do some popcount tricks?
+        prevPowerOf2 :: IExpr -> ImpM IExpr
+        prevPowerOf2 x = do
+          rPtr <- alloc IdxRepTy
+          copyAtom rPtr (IdxRepVal 1)
+          let getNext = imulI (IIdxRepVal 2) . fromScalarAtom =<< destToAtom rPtr
+          cond <- liftM snd $ scopedBlock $ do
+            canGrow <- getNext >>= (`iltI` x)
+            return ((), [canGrow])
+          wbody <- scopedVoidBlock $ do
+            copyAtom rPtr . toScalarAtom =<< getNext
+          emitStatement $ IWhile cond wbody
+          fromScalarAtom <$> destToAtom rPtr
+    Linearize _ -> error "Unexpected Linearize"
+    Transpose _ -> error "Unexpected Transpose"
+
+data LaunchInfo = LaunchInfo { numWorkgroups :: IExpr, workgroupSize :: IExpr }
+data ThreadInfo = ThreadInfo { tid :: IExpr, wid :: IExpr, threadRange :: Type }
+type KernelBuilder kernel = (ThreadInfo -> ImpM ()) -> ImpM kernel
+
+-- The rank 2 signature ensures that the call sites returns the result of the
+buildKernel :: Type -> (forall k. LaunchInfo -> KernelBuilder k -> ImpM (k, a)) -> ImpM a
+buildKernel idxTy f = do
+  n <- indexSetSize idxTy
+
+  numWorkgroupsVar <- freshVar $ "numWorkgroups" :> IIdxRepTy
+  workgroupSizeVar <- freshVar $ "workgroupSize" :> IIdxRepTy
+  let numWorkgroups = IVar numWorkgroupsVar
+  let workgroupSize = IVar workgroupSizeVar
+
+  tidVar  <- freshVar $ "tid"  :> IIdxRepTy
+  widVar  <- freshVar $ "wid"  :> IIdxRepTy
+  wszVar  <- freshVar $ "wsz"  :> IIdxRepTy
+  nthrVar <- freshVar $ "nthr" :> IIdxRepTy
+  let tid  = IVar tidVar
+  let wid  = IVar widVar
+  let wsz  = IVar wszVar
+  let nthr = IVar nthrVar
+  let threadInfoVars = [tidVar, widVar, wszVar, nthrVar]
+
+  opts <- ask
+  let (cc, dev) = case impBackend opts of
+        LLVMCUDA -> (CUDAKernelLaunch, GPU)
+        LLVMMC   -> (MCThreadLaunch  , CPU)
+        backend  -> error $ "Shouldn't be launching kernels from " ++ show backend
+
+  ((kernelBody, aux), env) <- scoped $ f LaunchInfo{..} $ \mkBody ->
+    withDevice dev $ withLevel ThreadLevel $ scopedVoidBlock $ do
+      gtid <- iaddI tid =<< imulI wid wsz
+      let threadRange = TC $ ParIndexRange dev (toScalarAtom gtid)
+                                               (toScalarAtom nthr)
+                                               idxTy
+      mkBody ThreadInfo{..}
+  let args = envAsVars $ freeIVars kernelBody `envDiff` (newEnv threadInfoVars (repeat ()))
+  kernelFunc <- emitFunction cc (fmap Bind (tidVar:widVar:wszVar:nthrVar:args)) kernelBody
+
+  emitImpDecl $ ImpLet [Bind numWorkgroupsVar, Bind workgroupSizeVar]
+                       (IQueryParallelism kernelFunc n)
+  extend env
+  emitStatement $ ILaunch kernelFunc n $ map IVar args
+  return aux
 
 -- === Destination type ===
 
@@ -815,6 +946,12 @@ imulI = embedBinOp imul
 idivI :: IExpr -> IExpr -> ImpM IExpr
 idivI = embedBinOp idiv
 
+iltI :: IExpr -> IExpr -> ImpM IExpr
+iltI = embedBinOp ilt
+
+bandI :: IExpr -> IExpr -> ImpM IExpr
+bandI x y = emitInstr $ IPrimOp $ ScalarBinOp BAnd x y
+
 impOffset :: IExpr -> IExpr -> ImpM IExpr
 impOffset ref off = emitInstr $ IPrimOp $ PtrOffset ref off
 
@@ -991,7 +1128,7 @@ instrTypeChecked instr = case instr of
     [] <- checkBlock consequent
     [] <- checkBlock alternative
     return []
-  IQueryParallelism _ _ -> return [Scalar Int32Type]
+  IQueryParallelism _ _ -> return [IIdxRepTy, IIdxRepTy]
   ILaunch _ n args -> [] <$ do
     -- TODO: check args against type of function
     assertHost
@@ -1020,6 +1157,7 @@ instrTypeChecked instr = case instr of
     valTy <- checkIExpr val
     assertEq ty valTy "Type mismatch in store"
   Free _ -> return []  -- TODO: check matched alloc/free
+  ISyncWorkgroup -> return [] -- TODO: Check that this is only used inside a kernel!
   IThrowError -> return []
   ICall (_:>IFunType _ argTys resultTys) args -> do
     argTys' <- mapM checkIExpr args
@@ -1118,7 +1256,8 @@ impInstrTypes instr = case instr of
   IWhile _ _      -> []
   ICond _ _ _     -> []
   ILaunch _ _ _   -> []
-  IQueryParallelism _ _ -> [Scalar Int32Type]
+  ISyncWorkgroup  -> []
+  IQueryParallelism _ _ -> [IIdxRepTy, IIdxRepTy]
   ICall (_:>IFunType _ _ resultTys) _ -> resultTys
 
 checkImpBinOp :: MonadError Err m => BinOp -> IType -> IType -> m IType
