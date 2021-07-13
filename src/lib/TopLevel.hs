@@ -11,6 +11,8 @@
 module TopLevel (evalSourceBlock, evalDecl, evalSource, evalFile,
                  initTopEnv, EvalConfig (..), TopEnv (..)) where
 
+import Data.Functor
+import Data.Foldable
 import Control.Exception (throwIO)
 import Control.Monad.State.Strict
 import Control.Monad.Reader
@@ -44,6 +46,9 @@ import Parser
 import Util (highlightRegion, measureSeconds)
 import Optimize
 import Parallelize
+
+import MLIR.Lower
+import MLIR.Eval
 
 import SaferNames.Bridge
 
@@ -237,8 +242,24 @@ roundtripSaferNamesPass :: Module -> Module
 roundtripSaferNamesPass (Module ir decls bindings) = Module ir decls' bindings
   where decls' = fromSafeB $ toSafeB decls
 
-evalBackend :: Bindings -> Block -> TopPassM Atom
-evalBackend env block = do
+-- TODO: Use the common part of LLVMExec for this too (setting up pipes, benchmarking, ...)
+-- TODO: Standalone functions --- use the env!
+evalMLIR :: Bindings -> Block -> TopPassM Atom
+evalMLIR _env block' = do
+  -- This is a little silly, but simplification likes to leave inlinable
+  -- let-bindings (they just construct atoms) in the block.
+  let block = inlineTraverse block'
+  let (moduleOp, recon@(Abs bs _)) = coreToMLIR block
+  liftIO $ do
+    let resultTypes = toList bs <&> binderAnn <&> \case BaseTy bt -> bt; _ -> error "Expected a base type"
+    resultVals <- evalModule moduleOp [] resultTypes
+    return $ applyNaryAbs recon $ Con . Lit <$> resultVals
+  where
+    inlineTraverse :: Block -> Block
+    inlineTraverse block = fst $ flip runSubstBuilder mempty $ traverseBlock substTraversalDef block
+
+evalLLVM :: Bindings -> Block -> TopPassM Atom
+evalLLVM env block = do
   backend <- asks (backendName . evalConfig)
   bench   <- asks benchmark
   logger  <- asks logService
@@ -263,6 +284,17 @@ evalBackend env block = do
   resultVals <- liftM (map (Con . Lit)) $ liftIO $
     llvmEvaluate logger llvmAST funcName ptrVals resultTypes
   return $ applyNaryAbs reconAtom resultVals
+
+evalBackend :: Bindings -> Block -> TopPassM Atom
+evalBackend env block = do
+  backend <- asks (backendName . evalConfig)
+  let eval = case backend of
+               MLIR        -> evalMLIR
+               LLVM        -> evalLLVM
+               LLVMMC      -> evalLLVM
+               LLVMCUDA    -> evalLLVM
+               Interpreter -> error "TODO"
+  eval env block
 
 withCompileTime :: TopPassM a -> TopPassM a
 withCompileTime m = do
