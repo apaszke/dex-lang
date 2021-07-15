@@ -18,6 +18,7 @@ import Control.Monad.State.Strict
 
 import Foreign.Ptr
 import Foreign.C.String
+import Foreign.C.Types
 import Foreign.Storable
 import Foreign.Marshal.Alloc
 
@@ -63,6 +64,13 @@ instance Storable ExportedSignature where
     pokeElemOff strAddr 1 =<< newCString res
     pokeElemOff strAddr 2 =<< newCString ccall
 
+data Backend = BCPU | BCUDA deriving (Enum, Bounded)
+
+tryToEnum :: forall a. (Enum a, Bounded a) => Int -> Maybe a
+tryToEnum value = do
+  guard $ value < (fromEnum (minBound @a)) || value > (fromEnum (maxBound @a))
+  return $ toEnum value
+
 dexCreateJIT :: IO (Ptr JIT)
 dexCreateJIT = do
   jitTargetMachine <- LLVM.Shims.newHostTargetMachine R.PIC CM.Large CGO.Aggressive
@@ -78,20 +86,26 @@ dexDestroyJIT jitPtr = do
   LLVM.JIT.destroyJIT jit
   LLVM.Shims.disposeTargetMachine jitTargetMachine
 
-dexCompile :: Ptr JIT -> Ptr Context -> Ptr Atom -> IO NativeFunctionAddr
-dexCompile jitPtr ctxPtr funcAtomPtr = do
+dexCompile :: Ptr JIT -> Ptr Context -> Ptr Atom -> CInt -> IO NativeFunctionAddr
+dexCompile jitPtr ctxPtr funcAtomPtr backendInt = do
   ForeignJIT{..} <- fromStablePtr jitPtr
   Context _ env <- fromStablePtr ctxPtr
   funcAtom <- fromStablePtr funcAtomPtr
-  let (impMod, nativeSignature) = prepareFunctionForExport
-                                    (topBindings env) "userFunc" funcAtom
-  nativeModule <- execLogger Nothing $ \logger -> do
-    llvmAST <- impToLLVM logger impMod
-    LLVM.JIT.compileModule jit llvmAST
-        (standardCompilationPipeline logger ["userFunc"] jitTargetMachine)
-  funcPtr <- castFunPtrToPtr <$> LLVM.JIT.getFunctionPtr nativeModule "userFunc"
-  modifyIORef addrTableRef $ M.insert funcPtr NativeFunction{..}
-  return $ funcPtr
+  case tryToEnum (fromIntegral backendInt) of
+    Just backend -> do
+      let dexBackend = case backend of
+            BCPU  -> LLVM
+            BCUDA -> LLVMCUDA
+      let (impMod, nativeSignature) = prepareFunctionForExport dexBackend
+                                          (topBindings env) "userFunc" funcAtom
+      nativeModule <- execLogger Nothing $ \logger -> do
+          llvmAST <- impToLLVM logger impMod
+          LLVM.JIT.compileModule jit llvmAST
+              (standardCompilationPipeline logger ["userFunc"] jitTargetMachine)
+      funcPtr <- castFunPtrToPtr <$> LLVM.JIT.getFunctionPtr nativeModule "userFunc"
+      modifyIORef addrTableRef $ M.insert funcPtr NativeFunction{..}
+      return $ funcPtr
+    Nothing       -> setError "Unknown backend" $> nullPtr
 
 dexGetFunctionSignature :: Ptr JIT -> NativeFunctionAddr -> IO (Ptr ExportedSignature)
 dexGetFunctionSignature jitPtr funcPtr = do

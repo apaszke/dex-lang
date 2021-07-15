@@ -32,6 +32,7 @@ import Logging
 import LLVMExec
 import PPrint
 import Optimize
+import Parallelize
 
 exportFunctions :: FilePath -> [(String, Atom)] -> Bindings -> IO ()
 exportFunctions objPath funcs env = do
@@ -39,7 +40,7 @@ exportFunctions objPath funcs env = do
   unless (length (nub names) == length names) $ liftEitherIO $
     throw CompilerErr "Duplicate export names"
   modules <- forM funcs $ \(name, funcAtom) -> do
-    let (impModule, _) = prepareFunctionForExport env name funcAtom
+    let (impModule, _) = prepareFunctionForExport LLVM env name funcAtom
     (,[name]) <$> execLogger Nothing (flip impToLLVM impModule)
   exportObjectFile objPath modules
 
@@ -61,8 +62,8 @@ runCArg :: CArgEnv -> CArgM a -> Builder (a, [IBinder], CArgEnv)
 runCArg initEnv m = repack <$> runCatT (runWriterT m) initEnv
   where repack ((ans, cargs), env) = (ans, cargs, env)
 
-prepareFunctionForExport :: Bindings -> String -> Atom -> (ImpModule, ExportedSignature)
-prepareFunctionForExport env nameStr func = do
+prepareFunctionForExport :: Backend -> Bindings -> String -> Atom -> (ImpModule, ExportedSignature)
+prepareFunctionForExport backend env nameStr func = do
   -- Create a module that simulates an application of arguments to the function
   -- TODO: Assert that the type of func is closed?
   let ((dest, cargs, apiDesc), (_, decls)) = flip runBuilder (freeVars func) $ do
@@ -77,14 +78,19 @@ prepareFunctionForExport env nameStr func = do
 
   let coreModule = Module Core decls mempty
   let defunctionalized = simplifyModule env coreModule
-  let Module _ optDecls optBindings = optimizeModule defunctionalized
+  let Module _ optDecls optBindings = applyOptimizations defunctionalized
   let (_, LetBound PlainLet outputExpr) = optBindings ! outputName
   let block = Block optDecls outputExpr
 
   let name = Name TopFunctionName (fromString nameStr) 0
-  let (_, impModule, _) = toImpModule env LLVM CEntryFun name cargs (Just dest) block
+  let (_, impModule, _) = toImpModule env backend CEntryFun name cargs (Just dest) block
   (impModule, apiDesc)
   where
+    applyOptimizations = case backend of
+      LLVM     -> optimizeModule
+      LLVMCUDA -> parallelizeModule . optimizeModule
+      _        -> error "Unsupported backend in export"
+
     outputName = GlobalName "_ans_"
 
     createArgs :: Type -> CArgM [(Atom, ExportArg)]
@@ -150,9 +156,12 @@ prepareFunctionForExport env nameStr func = do
       _ -> unsupported
       where unsupported = error $ "Unsupported result type: " ++ pprint ty
 
-    -- TODO: I guess that the address space depends on the backend?
-    -- TODO: Have an ExternalPtr tag?
-    ptrTy ty = PtrType (Heap CPU, ty)
+    ptrAddrSpace = case backend of
+      LLVM     -> CPU
+      LLVMCUDA -> GPU
+      _        -> error "Unsupported backend in export"
+
+    ptrTy ty = PtrType (Heap ptrAddrSpace, ty)
 
     getRectShape :: Env () -> IndexStructure -> Maybe [Either Name Int]
     getRectShape scope idx = traverse (dimShape . binderType) $ toList idx
